@@ -890,8 +890,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     if (convert_incompatible_tensor) {
                         switch (new_type) {
                             case GGML_TYPE_TQ1_0:
-                            case GGML_TYPE_TQ2_0:
-                            case GGML_TYPE_Q2_0:   new_type = GGML_TYPE_Q4_0; break;  // TODO: use a symmetric type instead
+                            case GGML_TYPE_TQ2_0:  new_type = GGML_TYPE_Q4_0; break;  // TODO: use a symmetric type instead
+                            case GGML_TYPE_Q2_0:   new_type = GGML_TYPE_Q8_0; break;  // symmetric fallback (matches the Q2_0 vec_dot pair)
                             case GGML_TYPE_IQ2_XXS:
                             case GGML_TYPE_IQ2_XS:
                             case GGML_TYPE_IQ2_S:
