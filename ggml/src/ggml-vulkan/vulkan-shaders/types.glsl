@@ -69,6 +69,29 @@ struct block_q4_0_packed16
 #define DATA_A_QUANT_LEGACY
 #endif
 
+#define QUANT_K_Q2_0 128
+#define QUANT_R_Q2_0 1
+
+struct block_q2_0
+{
+    float16_t d;
+    uint8_t qs[QUANT_K_Q2_0/4];
+};
+struct block_q2_0_packed16
+{
+    float16_t d;
+    uint16_t qs[QUANT_K_Q2_0/4/2];
+};
+
+#if defined(DATA_A_Q2_0)
+#define QUANT_K QUANT_K_Q2_0
+#define QUANT_R QUANT_R_Q2_0
+#define QUANT_AUXF 1
+#define A_TYPE block_q2_0
+#define A_TYPE_PACKED16 block_q2_0_packed16
+#define DATA_A_QUANT_LEGACY
+#endif
+
 #define QUANT_K_Q4_1 32
 #define QUANT_R_Q4_1 2
 

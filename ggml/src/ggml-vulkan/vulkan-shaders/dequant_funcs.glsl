@@ -33,6 +33,34 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_Q2_0)
+// Q2_0: 128 ternary codes per block, packed 4 codes per byte (R == 1).
+// Each code is in {0, 1, 2}; we map to {-1, 0, +1} via (code - 1) and scale by d.
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    // iqs is a 1-element index in [0, QUANT_K). When called from get_rows /
+    // mul_mat_vec we always have iqs even, so {iqs, iqs+1} live in the same
+    // packed byte (qs[iqs/4]).
+    const uint b = uint(data_a[a_offset + ib].qs[iqs >> 2]);
+    const uint shift0 = (iqs       & 3u) << 1;
+    const uint shift1 = ((iqs + 1u) & 3u) << 1;
+    return vec2(
+        float((b >> shift0) & 0x3u) - 1.0f,
+        float((b >> shift1) & 0x3u) - 1.0f
+    );
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    // mul_mat_vec always calls with iqs aligned to 4, so the four output codes
+    // live in a single packed byte (qs[iqs/4]).
+    const uint b = uint(data_a[a_offset + ib].qs[iqs >> 2]);
+    return vec4(
+        float((b >> 0) & 0x3u) - 1.0f,
+        float((b >> 2) & 0x3u) - 1.0f,
+        float((b >> 4) & 0x3u) - 1.0f,
+        float((b >> 6) & 0x3u) - 1.0f
+    );
+}
+#endif
+
 #if defined(DATA_A_Q4_1)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
@@ -448,7 +476,7 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q2_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }
