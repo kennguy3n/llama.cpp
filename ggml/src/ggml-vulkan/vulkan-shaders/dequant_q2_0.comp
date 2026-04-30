@@ -1,0 +1,29 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_q2_0 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    // Each thread processes one packed byte (4 ternary codes).
+    // 256 threads / 32 bytes per block = 8 blocks per workgroup.
+    const uint i  = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.x / 32u;
+    const uint tid = gl_LocalInvocationID.x % 32u;
+
+    const uint nblocks = p.nel / 128u;
+    if (i >= nblocks) {
+        return;
+    }
+
+    const float d = float(data_a[i].d);
+    const uint b = uint(data_a[i].qs[tid]);
+    const uint b_idx = 128u * i + 4u * tid;
+
+    data_b[b_idx + 0u] = D_TYPE(d * (float((b >> 0) & 0x3u) - 1.0f));
+    data_b[b_idx + 1u] = D_TYPE(d * (float((b >> 2) & 0x3u) - 1.0f));
+    data_b[b_idx + 2u] = D_TYPE(d * (float((b >> 4) & 0x3u) - 1.0f));
+    data_b[b_idx + 3u] = D_TYPE(d * (float((b >> 6) & 0x3u) - 1.0f));
+}

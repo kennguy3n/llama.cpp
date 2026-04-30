@@ -30,6 +30,23 @@ float16_t dequantFuncQ4_0(const in decodeBufQ4_0 bl, const in uint blockCoords[2
     return ret;
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ2_0 {
+   block_q2_0 block;
+};
+
+float16_t dequantFuncQ2_0(const in decodeBufQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    // Q2_0 layout: 128 ternary codes per block, packed 4 codes per byte.
+    // coordInBlock[1] is the element index in [0, 128).
+    const float16_t d = bl.block.d;
+    const uint idx = coordInBlock[1];
+    const uint b = uint(bl.block.qs[idx >> 2]);
+    const uint shift = (idx & 0x3u) << 1;
+    const uint code = (b >> shift) & 0x3u;
+    float16_t ret = (float16_t(code) - float16_t(1)) * d;
+    return ret;
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufQ4_1 {
    block_q4_1 block;
 };
@@ -687,6 +704,8 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
 
 #if defined(DATA_A_Q4_0)
 #define dequantFuncA dequantFuncQ4_0
+#elif defined(DATA_A_Q2_0)
+#define dequantFuncA dequantFuncQ2_0
 #elif defined(DATA_A_Q4_1)
 #define dequantFuncA dequantFuncQ4_1
 #elif defined(DATA_A_Q5_0)

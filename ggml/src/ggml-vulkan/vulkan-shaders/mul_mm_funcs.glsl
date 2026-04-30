@@ -61,6 +61,27 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             buf_a[buf_idx + 1] = FLOAT_TYPE_VEC2(v0.zw);
             buf_a[buf_idx + 8] = FLOAT_TYPE_VEC2(v1.xy);
             buf_a[buf_idx + 9] = FLOAT_TYPE_VEC2(v1.zw);
+#elif defined(DATA_A_Q2_0)
+            // Q2_0: block of 128 ternary codes packed 4-per-byte (R == 1).
+            // LOAD_VEC_A == 4 -> 32 vector loads per block, each load handles
+            // 4 consecutive elements (one packed byte).
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+
+            const uint ib = idx / 32;
+            const uint iqs = idx & 0x1F;
+
+            const float d = float(data_a[ib].d);
+            const uint b = uint(data_a[ib].qs[iqs]);
+            const vec4 v = vec4(
+                float((b >> 0) & 0x3u) - 1.0f,
+                float((b >> 2) & 0x3u) - 1.0f,
+                float((b >> 4) & 0x3u) - 1.0f,
+                float((b >> 6) & 0x3u) - 1.0f
+            ) * d;
+
+            buf_a[buf_idx    ] = FLOAT_TYPE_VEC2(v.xy);
+            buf_a[buf_idx + 1] = FLOAT_TYPE_VEC2(v.zw);
 #elif defined(DATA_A_Q4_1)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
