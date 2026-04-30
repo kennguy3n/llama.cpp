@@ -14,6 +14,9 @@
 #define N_R0_Q1_0_g128 4
 #define N_SG_Q1_0_g128 2
 
+#define N_R0_Q2_0 4
+#define N_SG_Q2_0 2
+
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
 
