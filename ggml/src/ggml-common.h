@@ -192,6 +192,8 @@ static_assert(sizeof(block_q1_0_g128) == sizeof(ggml_half) + QK1_0_g128 / 8, "wr
 // Block size 128, 2-bit-per-element packed 4 elements per byte (bits 0-1, 2-3, 4-5, 6-7).
 // 2 bytes fp16 scale + 32 bytes packed data = 34 bytes per block (2.125 bpw).
 #define QK2_0 128
+#define QI2_0 (QK2_0 / (4 * 2))  // Number of int32s of packed codes per block (32 bytes / 4)
+#define QR2_0 1                   // contiguous output layout: byte k packs elements 4k..4k+3
 typedef struct {
     ggml_half d;          // delta (per-block scale; amax of the block)
     uint8_t qs[QK2_0 / 4]; // 2 bits per element, 4 elements per byte
