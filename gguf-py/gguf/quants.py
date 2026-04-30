@@ -653,6 +653,40 @@ class TQ2_0(__Quant, qtype=GGMLQuantizationType.TQ2_0):
         return (d * qs.astype(np.float32))
 
 
+class Q2_0(__Quant, qtype=GGMLQuantizationType.Q2_0):
+    # Block size 128. 4 codes per byte, packed sequentially (bits 0-1, 2-3, 4-5, 6-7).
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d = abs(blocks).max(axis=-1, keepdims=True)
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        qs = np_roundf(blocks * id)
+        qs = (qs.astype(np.int8) + np.int8(1)).astype(np.uint8)  # {-1,0,1} -> {0,1,2}
+
+        qs = qs.reshape((n_blocks, 32, 4)) << np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4))
+        qs = qs[..., 0] | qs[..., 1] | qs[..., 2] | qs[..., 3]
+        qs = qs.reshape((n_blocks, 32))
+
+        d = d.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, qs = np.hsplit(blocks, [2])
+
+        d = d.view(np.float16).astype(np.float32)
+
+        qs = qs.reshape((n_blocks, 32, 1)) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4))
+        qs = (qs & 0x03).reshape((n_blocks, 128)).astype(np.int8) - np.int8(1)
+
+        return d * qs.astype(np.float32)
+
+
 class MXFP4(__Quant, qtype=GGMLQuantizationType.MXFP4):
     # e2m1 values (doubled)
     # ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf

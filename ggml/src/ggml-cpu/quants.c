@@ -30,6 +30,10 @@ void quantize_row_q1_0_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT 
     quantize_row_q1_0_g128_ref(x, y, k);
 }
 
+void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q2_0_ref(x, y, k);
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -123,59 +127,101 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
-    
+
     assert(n % qk == 0);
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
     UNUSED(bs);
-    
+
     const block_q1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
-    
-    
+
+
     float sumf = 0.0;
-    
+
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_FP16_TO_FP32(x[i].d);
         const float d1 = GGML_FP16_TO_FP32(y[i].d);
-        
+
         int sumi = 0;
-        
+
         for (int j = 0; j < QK1_0; j++) {
             const int bit_index = j;
             const int byte_index = bit_index / 8;
             const int bit_offset = bit_index % 8;
-            
+
             // Extract bit: 1 = +1, 0 = -1
             const int xi = ((x[i].qs[byte_index] >> bit_offset) & 1) ? 1 : -1;
             const int yi = y[i].qs[j];
-            
+
             sumi += xi * yi;
         }
-        
+
         sumf += d0 * d1 * sumi;
     }
-    
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
+    const int nb = n / qk;
+    const int nsub = QK2_0 / QK8_0; // 4
+
+    assert(n % qk == 0);
+    assert(QK2_0 % QK8_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float dx = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int k = 0; k < nsub; k++) {
+            const block_q8_0 * GGML_RESTRICT yk = &y[i*nsub + k];
+            const float dy = GGML_FP16_TO_FP32(yk->d);
+
+            int sumi = 0;
+            for (int j = 0; j < QK8_0; j++) {
+                const int elem       = k*QK8_0 + j;
+                const int byte_index = elem >> 2;
+                const int shift      = (elem & 3) * 2;
+                const int q          = (x[i].qs[byte_index] >> shift) & 0x3;
+                const int xi         = q - 1; // {-1, 0, +1}
+                sumi += xi * yk->qs[j];
+            }
+
+            sumf += dx * dy * sumi;
+        }
+    }
+
     *s = sumf;
 }
 
 void ggml_vec_dot_q1_0_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK1_0_g128;
     const int nb = n / qk;
-    
+
     assert(n % qk == 0);
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
     UNUSED(bs);
-    
+
     const block_q1_0_g128 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
-    
-    
+
+
     float sumf = 0.0;
 
     // Each Q1_0_g128 block has 128 elements, each Q8_0 block has 32 elements
@@ -208,7 +254,7 @@ void ggml_vec_dot_q1_0_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t 
 
         sumf += d0 * sumi;
     }
-    
+
     *s = sumf;
 }
 
