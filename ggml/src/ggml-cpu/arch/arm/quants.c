@@ -137,7 +137,7 @@ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 
 //===================================== Dot products =================================
 
-void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {    
+void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     // For nrc > 1, call generic multiple times
     if (nrc == 1) {
         ggml_vec_dot_q1_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
@@ -147,9 +147,33 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         const int nb = n / qk;
         const size_t x_size = nb * sizeof(block_q1_0);
         const size_t y_size = nb * sizeof(block_q8_0);
-        
+
         for (int i = 0; i < nrc; i++) {
             ggml_vec_dot_q1_0_q8_0_generic(
+                n,
+                s + i,
+                bs,
+                (const char *)vx + i * x_size,
+                bx,
+                (const char *)vy + i * y_size,
+                by,
+                1
+            );
+        }
+    }
+}
+
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    if (nrc == 1) {
+        ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+    } else {
+        const int qk = QK8_0;
+        const int nb = n / qk;
+        const size_t x_size = nb * sizeof(block_q2_0);
+        const size_t y_size = nb * sizeof(block_q8_0);
+
+        for (int i = 0; i < nrc; i++) {
+            ggml_vec_dot_q2_0_q8_0_generic(
                 n,
                 s + i,
                 bs,
@@ -4189,4 +4213,3 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
-

@@ -101,6 +101,49 @@ void quantize_row_q1_0_g128_ref(const float * GGML_RESTRICT x, block_q1_0_g128 *
     }
 }
 
+// Ternary 2-bit quantization (block size 32, 2 bytes scale + 8 bytes packed
+// 2-bit codes). Maps weights to {-1, 0, +1} via codes {0, 1, 2}.
+void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        // Per-block scale = absolute max
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = fabsf(x[i*qk + j]);
+            if (v > amax) amax = v;
+        }
+
+        const float d  = amax;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        // Clear all packed bytes first
+        for (int j = 0; j < qk / 4; ++j) {
+            y[i].qs[j] = 0;
+        }
+
+        // Quantize each weight to {-1, 0, +1} → code {0, 1, 2}, packed
+        // 4 codes per byte at bits 0-1, 2-3, 4-5, 6-7.
+        for (int j = 0; j < qk; ++j) {
+            const float v = x[i*qk + j] * id;
+            int q;
+            if      (v >  0.5f) q = 2; // +1
+            else if (v < -0.5f) q = 0; // -1
+            else                q = 1; //  0
+
+            const int byte_index = j >> 2;
+            const int shift      = (j & 3) * 2;
+            y[i].qs[byte_index] |= (uint8_t)(q << shift);
+        }
+    }
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
@@ -410,6 +453,27 @@ void dequantize_row_q1_0_g128(const block_q1_0_g128 * GGML_RESTRICT x, float * G
             const int bit_offset = j % 8;
             const uint8_t bit = (x[i].qs[byte_index] >> bit_offset) & 1;
             y[i*qk + j] = bit ? d : neg_d;
+        }
+    }
+}
+
+
+void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        // Unpack 2-bit codes (4 per byte) and map {0,1,2} → {-1,0,+1}.
+        for (int j = 0; j < qk; ++j) {
+            const int byte_index = j >> 2;
+            const int shift      = (j & 3) * 2;
+            const int q = (x[i].qs[byte_index] >> shift) & 0x3;
+            y[i*qk + j] = d * (float)(q - 1);
         }
     }
 }
@@ -2057,6 +2121,13 @@ size_t quantize_q1_0_g128(const float * GGML_RESTRICT src, void * GGML_RESTRICT 
         qrow += row_size;
     }
     return nrow * row_size;
+}
+
+
+size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights; // imatrix not used for ternary q2_0
+    quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
 }
 
 
@@ -5350,6 +5421,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q1_0_g128:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q1_0_g128, data, nb);
+            } break;
+        case GGML_TYPE_Q2_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
             } break;
         case GGML_TYPE_Q4_0:
             {

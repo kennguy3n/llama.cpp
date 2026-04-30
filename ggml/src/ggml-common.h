@@ -188,6 +188,16 @@ typedef struct {
 } block_q1_0_g128;
 static_assert(sizeof(block_q1_0_g128) == sizeof(ggml_half) + QK1_0_g128 / 8, "wrong q1_0_g128 block size/padding");
 
+// Ternary 2-bit quantization (values in {-1, 0, +1}, encoded as 2-bit codes {0, 1, 2}).
+// Block size 128, 2-bit-per-element packed 4 elements per byte (bits 0-1, 2-3, 4-5, 6-7).
+// 2 bytes fp16 scale + 32 bytes packed data = 34 bytes per block (2.125 bpw).
+#define QK2_0 128
+typedef struct {
+    ggml_half d;          // delta (per-block scale; amax of the block)
+    uint8_t qs[QK2_0 / 4]; // 2 bits per element, 4 elements per byte
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
