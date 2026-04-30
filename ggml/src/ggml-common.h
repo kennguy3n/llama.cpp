@@ -99,6 +99,8 @@ typedef sycl::half2 ggml_half2;
 #define QI1_0_g128 (QK1_0_g128 / 32)  // Number of int32s needed for QK1_0_g128 bits (QK1_0_g128/32)
 #define QR1_0_g128 1              // 1 bit per quantized element (matches the 1-bit nature of Q1_0_g128)
 
+#define QI2_0 (QK2_0 / 32)  // 4 Q8_1 sub-blocks per Q2_0 block (matches the qi convention used by MMVQ)
+#define QR2_0 1             // contiguous output layout: byte k packs elements 4k..4k+3
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2

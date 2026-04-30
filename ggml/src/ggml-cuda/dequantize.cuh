@@ -46,6 +46,26 @@ static __device__ __forceinline__ void dequantize_q1_0_g128(const void * vx, con
     v.y = bit_1 ? d : neg_d;
 }
 
+static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+
+    const float d = x[ib].d;
+
+    // iqs is even (the kernel sets i00 = 2*tid -> iqs always even with qr=1).
+    // Two consecutive elements always live in the same packed byte.
+    const int byte_index = iqs >> 2;
+    const int shift0     = (iqs       & 3) << 1;  // 0 or 4
+    const int shift1     = ((iqs + 1) & 3) << 1;  // 2 or 6
+
+    const uint8_t qb = x[ib].qs[byte_index];
+    const int code0  = (qb >> shift0) & 0x3;
+    const int code1  = (qb >> shift1) & 0x3;
+
+    // {0, 1, 2} -> {-1, 0, +1}, scaled by d.
+    v.x = (float)(code0 - 1) * d;
+    v.y = (float)(code1 - 1) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 

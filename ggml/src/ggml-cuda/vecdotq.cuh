@@ -119,30 +119,30 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q1_0_q8_1_imp
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
         const int vi = v[i];
-        
+
         // Unpack 32 bits into 32 signed values (-1 or +1)
         // Each bit: 0 -> -1, 1 -> +1
         // Process all 32 bits, converting each to a signed byte
-        
+
         int vi_bytes[8];
-        
+
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             // Extract 4 bits and convert each to -1 or +1
             const int shift = j * 4;
             const int bits4 = (vi >> shift) & 0x0F;
-            
+
             // Convert each of the 4 bits to a signed byte, then pack into int
             // bit=1 -> +1, bit=0 -> -1
             const int b0 = (bits4 & 0x01) ? 1 : -1;
             const int b1 = (bits4 & 0x02) ? 1 : -1;
             const int b2 = (bits4 & 0x04) ? 1 : -1;
             const int b3 = (bits4 & 0x08) ? 1 : -1;
-            
+
             // Pack 4 signed bytes into a single int for dp4a
             vi_bytes[j] = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
         }
-        
+
         // Perform dot product using dp4a (4-way int8 dot product)
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
@@ -717,17 +717,17 @@ static __device__ __forceinline__ float vec_dot_q1_0_g128_q8_1(
     // Q1_0_g128: 128 elements with ONE scale
     // Q8_1: 32 elements per block with individual scales
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
-    
+
     const float d1 = bq1_0_g128->d;
-    
+
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
-    
+
     // Load 32 bits (4 bytes) for this chunk from Q1_0_g128
     const int offset = iqs * 4;
     const int v = bq1_0_g128->qs[offset + 0] | (bq1_0_g128->qs[offset + 1] << 8) |
                   (bq1_0_g128->qs[offset + 2] << 16) | (bq1_0_g128->qs[offset + 3] << 24);
-    
+
     // Unpack 32 bits into 32 signed values (-1 or +1)
     int vi_bytes[8];
 #pragma unroll
@@ -740,7 +740,7 @@ static __device__ __forceinline__ float vec_dot_q1_0_g128_q8_1(
         const int b3 = (bits4 & 0x08) ? 1 : -1;
         vi_bytes[j] = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
     }
-    
+
     // Compute dot product for this 32-element chunk
     int sumi = 0;
 #pragma unroll
@@ -748,10 +748,77 @@ static __device__ __forceinline__ float vec_dot_q1_0_g128_q8_1(
         const int u = get_int_b4(bq8_1_chunk->qs, j);
         sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
     }
-    
+
     // Apply Q1_0_g128's single scale and this chunk's Q8_1 scale
     const float2 ds8f = __half22float2(bq8_1_chunk->ds);
     return d1 * ds8f.x * sumi;
+}
+
+// Q2_0: ternary 2-bit codes packed 4 per byte; 128-element block split into 4
+// Q8_1 sub-blocks of 32 (selected by iqs = 0..3). Symmetric (no offset bias).
+#define VDR_Q2_0_Q8_1_MMVQ 1
+#define VDR_Q2_0_Q8_1_MMQ  8
+
+template <int vdr> static __device__ __forceinline__ float vec_dot_q2_0_q8_1_impl(
+    const int * v, const int * u, const float & d2, const half2 & ds8) {
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < 2*vdr; ++i) {
+        // Each int v[i] holds 16 codes (4 bytes x 4 codes/byte).
+        const int vi = v[i];
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            // Extract 4 codes from byte j -> map {0,1,2} to signed {-1,0,+1},
+            // pack into a single int and accumulate via dp4a.
+            const int byte_val = (vi >> (j*8)) & 0xFF;
+            const int c0 = ((byte_val >> 0) & 0x3) - 1;
+            const int c1 = ((byte_val >> 2) & 0x3) - 1;
+            const int c2 = ((byte_val >> 4) & 0x3) - 1;
+            const int c3 = ((byte_val >> 6) & 0x3) - 1;
+
+            const int packed = (c0 & 0xFF)
+                             | ((c1 & 0xFF) <<  8)
+                             | ((c2 & 0xFF) << 16)
+                             | ((c3 & 0xFF) << 24);
+
+            sumi = ggml_cuda_dp4a(packed, u[i*4 + j], sumi);
+        }
+    }
+
+    const float2 ds8f = __half22float2(ds8);
+    // Symmetric quant: only the Q8_1 scale matters (the sum field cancels).
+    return d2 * ds8f.x * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
+    const float d2 = bq2_0->d;
+
+    // iqs in [0,3]: select one Q8_1 sub-block (32 elements / 8 packed Q2_0 bytes).
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    int v[2*VDR_Q2_0_Q8_1_MMVQ];
+    const int byte_offset = iqs * 8;
+#pragma unroll
+    for (int i = 0; i < 2*VDR_Q2_0_Q8_1_MMVQ; ++i) {
+        v[i] = bq2_0->qs[byte_offset + i*4 + 0]
+             | (bq2_0->qs[byte_offset + i*4 + 1] <<  8)
+             | (bq2_0->qs[byte_offset + i*4 + 2] << 16)
+             | (bq2_0->qs[byte_offset + i*4 + 3] << 24);
+    }
+
+    int u[8*VDR_Q2_0_Q8_1_MMVQ];
+#pragma unroll
+    for (int j = 0; j < 8*VDR_Q2_0_Q8_1_MMVQ; ++j) {
+        u[j] = get_int_b4(bq8_1_chunk->qs, j);
+    }
+
+    return vec_dot_q2_0_q8_1_impl<VDR_Q2_0_Q8_1_MMVQ>(v, u, d2, bq8_1_chunk->ds);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
