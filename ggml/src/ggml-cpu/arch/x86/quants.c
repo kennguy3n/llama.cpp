@@ -667,7 +667,91 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     int   ib   = 0;
     float sumf = 0.0f;
 
-#if defined(__AVX2__)
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
+    // AVX-512BW+VL+VNNI path: process two Q8_0 sub-blocks per inner iteration
+    // in 512-bit lanes, halving the inner-loop iteration count vs. the AVX2 path.
+    //
+    // Per-block layout: 16 packed Q2_0 bytes -> 64 ternary codes -> 64 signed
+    // bytes paired with 64 Q8_0 bytes from two consecutive sub-blocks.
+
+    __m512 acc = _mm512_setzero_ps();
+
+    // Replication shuffle (per 128-bit lane): each source byte expands to 4
+    // consecutive output bytes. With a 16-byte broadcast input, the four
+    // 128-bit lanes pick source bytes [0-3], [4-7], [8-11], [12-15] respectively.
+    const __m512i shuf512 = _mm512_setr_epi8(
+        0,  0,  0,  0,   1,  1,  1,  1,    2,  2,  2,  2,    3,  3,  3,  3,
+        4,  4,  4,  4,   5,  5,  5,  5,    6,  6,  6,  6,    7,  7,  7,  7,
+        8,  8,  8,  8,   9,  9,  9,  9,   10, 10, 10, 10,   11, 11, 11, 11,
+       12, 12, 12, 12,  13, 13, 13, 13,   14, 14, 14, 14,   15, 15, 15, 15
+    );
+    const __m512i pos0_512 = _mm512_set1_epi32(0x000000FFu);
+    const __m512i pos1_512 = _mm512_set1_epi32(0x0000FF00u);
+    const __m512i pos2_512 = _mm512_set1_epi32(0x00FF0000u);
+    const __m512i pos3_512 = _mm512_set1_epi32((int)0xFF000000u);
+    const __m512i mask3_512 = _mm512_set1_epi8(0x03);
+    const __m512i zero_512  = _mm512_setzero_si512();
+    const __m512i ones_512  = _mm512_set1_epi8(0x01);
+    const __m512i twos_512  = _mm512_set1_epi8(0x02);
+
+    for (; ib < nb; ++ib) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        // Process the 4 Q8_0 sub-blocks two at a time (k = 0, 2).
+        for (int k = 0; k < nsub; k += 2) {
+            const block_q8_0 * GGML_RESTRICT yk0 = &y[ib*nsub + k];
+            const block_q8_0 * GGML_RESTRICT yk1 = &y[ib*nsub + k + 1];
+
+            // Load the 16 packed Q2_0 bytes that cover both sub-blocks.
+            const __m128i src128 = _mm_loadu_si128((const __m128i *)(x[ib].qs + k*8));
+            const __m512i src    = _mm512_broadcast_i32x4(src128);
+
+            // Replicate each source byte 4-way to align with 4 codes per byte.
+            const __m512i rep = _mm512_shuffle_epi8(src, shuf512);
+
+            // Four shifted-and-masked streams + position blending (same idea as
+            // the AVX2 path, just on 512-bit lanes).
+            const __m512i v0 = _mm512_and_si512(rep, mask3_512);
+            const __m512i v1 = _mm512_and_si512(_mm512_srli_epi16(rep, 2), mask3_512);
+            const __m512i v2 = _mm512_and_si512(_mm512_srli_epi16(rep, 4), mask3_512);
+            const __m512i v3 = _mm512_and_si512(_mm512_srli_epi16(rep, 6), mask3_512);
+
+            const __m512i codes = _mm512_or_si512(
+                _mm512_or_si512(_mm512_and_si512(v0, pos0_512), _mm512_and_si512(v1, pos1_512)),
+                _mm512_or_si512(_mm512_and_si512(v2, pos2_512), _mm512_and_si512(v3, pos3_512))
+            );
+
+            // Load qy for the two sub-blocks (block_q8_0 is 34 bytes, so the
+            // sub-blocks are not contiguous in memory — combine via insert).
+            const __m256i qy_lo = _mm256_loadu_si256((const __m256i *)yk0->qs);
+            const __m256i qy_hi = _mm256_loadu_si256((const __m256i *)yk1->qs);
+            const __m512i qy    = _mm512_inserti32x8(_mm512_castsi256_si512(qy_lo), qy_hi, 1);
+
+            // Build signed_qy directly from the codes via masked blends, skipping
+            // the explicit (codes - 1) materialisation:
+            //   code == 0  -> -qy
+            //   code == 1  ->  0
+            //   code == 2  -> +qy
+            const __m512i  neg_qy = _mm512_sub_epi8(zero_512, qy);
+            const __mmask64 m_neg = _mm512_cmpeq_epi8_mask(codes, zero_512);
+            const __mmask64 m_pos = _mm512_cmpeq_epi8_mask(codes, twos_512);
+            __m512i signed_qy = _mm512_mask_blend_epi8(m_neg, zero_512, neg_qy);
+                    signed_qy = _mm512_mask_blend_epi8(m_pos, signed_qy, qy);
+
+            // VNNI: sum signed_qy in 4-byte groups -> 16 int32 partial sums.
+            const __m512i int_acc = _mm512_dpbusd_epi32(zero_512, ones_512, signed_qy);
+
+            // Per-sub-block scales: lower 8 lanes for sub-block k, upper 8 for k+1.
+            const __m256 d_lo = _mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(yk0->d));
+            const __m256 d_hi = _mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(yk1->d));
+            const __m512 d    = _mm512_insertf32x8(_mm512_castps256_ps512(d_lo), d_hi, 1);
+
+            acc = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(int_acc), acc);
+        }
+    }
+
+    sumf = _mm512_reduce_add_ps(acc);
+#elif defined(__AVX2__)
     __m256 acc = _mm256_setzero_ps();
 
     // Per-position byte masks: select which of the 4 shifted streams contributes
