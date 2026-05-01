@@ -135,6 +135,45 @@ to push throughput close to the AVX-512 fast-path (~70 t/s
 projected). A follow-up run on an Alder Lake P-core or Zen 4 host
 will quantify that gain.
 
+## Verifying Kernel B (AVX-VNNI) on hosts without VNNI
+
+Zen 3 / Skylake-X / Cascade Lake hosts can't execute Kernel B at all
+(`vpdpbusd_avx` is `#UD`). To prove the AVX-VNNI implementation is
+*functionally* correct without owning Alder Lake or Zen 4 hardware,
+run it under
+[Intel SDE](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html):
+
+```bash
+cmake -S . -B build-vnni -DLLAMA_MICROBENCH_AVX_VNNI=ON
+cmake --build build-vnni -j --target microbench-q1-g128-repack
+
+# Use SDE's Alder Lake (`-adl`) chip-check + CPUID profile.
+sde64 -adl -- ./build-vnni/bin/microbench-q1-g128-repack \
+    --blocks 1024 --iters 4
+```
+
+The resulting parity check (committed at
+[`parity-alderlake-sde.txt`](parity-alderlake-sde.txt)) confirms
+Kernel B produces row-by-row identical FP32 output to Kernel A and
+the scalar baseline.
+
+**Important**: SDE timing is meaningless. SDE dynamically translates
+VNNI to host-native instruction sequences, so the
+`gemv_4x4_avx_vnni` timing line under SDE is hundreds of times
+slower than native execution would be. The `scalar`, `vec_dot_avx2`,
+and `gemv_4x4_avx2` timing lines under SDE *are* representative
+because those instructions run natively on the AMD host underneath
+SDE — the 1.28× ratio between them holds across SDE and bare-metal
+runs.
+
+To get real AVX-VNNI throughput numbers we need an Alder Lake P-core
+or Zen 4 host; that's tracked as a Phase-3 follow-up.
+
+qemu-user is **not** a viable alternative. qemu 6.2 (Ubuntu 22.04's
+default) accepts the `+avx-vnni` CPU flag at the command line but its
+TCG translator does not implement the instruction; the binary
+segfaults on the first `vpdpbusd_avx`.
+
 ## Phase gate
 
 This harness produces the data that gates Phase 3. The Phase-1c

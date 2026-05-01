@@ -114,8 +114,11 @@ float fp16_to_fp32(uint16_t h) {
     if (exp == 0) {
         bits = sign << 31;
         if (mant != 0) {
-            // subnormal
-            int e = -1;
+            // subnormal: FP16 subnormal true exponent is 1 - 15 = -14, so
+            // start at e = -15 and decrement once per left shift before the
+            // implicit-1 bit appears in mant[10]. Final FP32 biased exponent
+            // is 127 + (e + 1).
+            int e = -15;
             uint32_t m = mant;
             while ((m & 0x400) == 0) { m <<= 1; --e; }
             m &= 0x3ff;
@@ -580,16 +583,17 @@ bool run_parity(int nb, uint64_t seed) {
     for (int r = 0; r < 4; ++r) {
         const bool a = approx_equal(scalar[r], avx2_single[r]);
         const bool b = approx_equal(scalar[r], gemv_avx2[r]);
-        ok = ok && a && b;
+        bool row_ok = a && b;
         std::printf(
             "  row %d  scalar=%14.6f  avx2_single=%14.6f  gemv_avx2=%14.6f",
             r, scalar[r], avx2_single[r], gemv_avx2[r]);
 #if defined(__AVXVNNI__)
         const bool c = approx_equal(scalar[r], gemv_vnni[r]);
-        ok = ok && c;
+        row_ok = row_ok && c;
         std::printf("  gemv_vnni=%14.6f", gemv_vnni[r]);
 #endif
-        std::printf("  %s\n", (a && b) ? "OK" : "MISMATCH");
+        ok = ok && row_ok;
+        std::printf("  %s\n", row_ok ? "OK" : "MISMATCH");
     }
     return ok;
 }

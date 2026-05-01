@@ -1,0 +1,48 @@
+# Parity-only AVX-VNNI verification on Intel SDE 9.48 (`-adl` Alder Lake)
+#
+# Build:
+#   cmake -S . -B build-vnni -DLLAMA_MICROBENCH_AVX_VNNI=ON
+#   cmake --build build-vnni -j --target microbench-q1-g128-repack
+# Run:
+#   sde64 -adl -- ./build-vnni/bin/microbench-q1-g128-repack \
+#       --blocks 1024 --iters 4
+#
+# What this checks:
+#
+#   * Kernel B (gemv_4x4_avx_vnni) is implemented correctly. Every row's
+#     output matches the scalar baseline AND the AVX2 4x4 kernel, within
+#     FP16 tolerance, after going through `_mm256_dpbusd_avx_epi32` on
+#     SDE's instruction-accurate Alder Lake emulator.
+#
+# What this does NOT check:
+#
+#   * Performance. SDE dynamically translates VNNI to a host-native
+#     sequence; the "gemv_4x4_avx_vnni" timing line below (~570 us /
+#     4 rows) is meaningless because each VNNI instruction expands to
+#     dozens of host instructions during translation. A real Alder Lake
+#     P-core or Zen 4 host is needed to measure true VNNI throughput;
+#     that's a follow-up after the harness lands.
+#
+# What the timing IS valid for: comparing scalar / vec_dot_avx2 /
+# gemv_4x4_avx2 to each other (those instructions run natively on
+# the AMD EPYC 7763 host SDE is layered on top of). The 1.28x ratio
+# between vec_dot_avx2 and gemv_4x4_avx2 holds under SDE too.
+
+microbench-q1-g128-repack: Phase 2 harness for the proposed AVX2/AVX-VNNI
+  runtime repack of Q1_0_g128. See docs/avx2-repack-design/03-design-brief.md
+  Configuration: nb=1024 (n=131072 weights), iters=4, seed=0xc0ffee
+
+Build features: AVXVNNI AVX2 FMA F16C
+
+Parity check (4 rows, scalar baseline):
+  row 0  scalar=    -74.092728  avx2_single=    -74.092804  gemv_avx2=    -74.092804  gemv_vnni=    -74.092804  OK
+  row 1  scalar=   -334.183228  avx2_single=   -334.183350  gemv_avx2=   -334.183350  gemv_vnni=   -334.183350  OK
+  row 2  scalar=    134.823944  avx2_single=    134.824066  gemv_avx2=    134.824066  gemv_vnni=    134.824066  OK
+  row 3  scalar=   -129.811859  avx2_single=   -129.811981  gemv_avx2=   -129.811981  gemv_vnni=   -129.811981  OK
+Parity: OK
+
+  Timing (1024 weight blocks = 131072 weights, 4 iters, median ns):
+    scalar                     2566894 ns / 4 rows  (641723.5 ns/row)
+    vec_dot_avx2                 49833 ns / 4 rows  (12458.2 ns/row)
+    gemv_4x4_avx2 (NEW)          33081 ns / 4 rows  (8270.2 ns/row)
+    gemv_4x4_avx_vnni (NEW)      630708 ns / 4 rows  (157677.0 ns/row)
