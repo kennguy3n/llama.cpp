@@ -679,12 +679,18 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     // Replication shuffle (per 128-bit lane): each source byte expands to 4
     // consecutive output bytes. With a 16-byte broadcast input, the four
     // 128-bit lanes pick source bytes [0-3], [4-7], [8-11], [12-15] respectively.
-    const __m512i shuf512 = _mm512_setr_epi8(
-        0,  0,  0,  0,   1,  1,  1,  1,    2,  2,  2,  2,    3,  3,  3,  3,
-        4,  4,  4,  4,   5,  5,  5,  5,    6,  6,  6,  6,    7,  7,  7,  7,
-        8,  8,  8,  8,   9,  9,  9,  9,   10, 10, 10, 10,   11, 11, 11, 11,
-       12, 12, 12, 12,  13, 13, 13, 13,   14, 14, 14, 14,   15, 15, 15, 15
-    );
+    //
+    // Each group of 4 identical bytes is encoded as one 32-bit constant so
+    // we can build the shuffle vector with _mm512_setr_epi32, which is part
+    // of the AVX-512F intrinsic header and available in GCC >= 6 / Clang >= 4.
+    // (_mm512_setr_epi8 was added later, in GCC 12; building with older
+    // toolchains for AVX-512 variants such as `skylakex` / `zen4` would
+    // otherwise fail with "implicit declaration of function _mm512_setr_epi8".)
+    const __m512i shuf512 = _mm512_setr_epi32(
+        0x00000000, 0x01010101, 0x02020202, 0x03030303,   // lane 0 (bytes 0..15  ->  0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3)
+        0x04040404, 0x05050505, 0x06060606, 0x07070707,   // lane 1 (bytes 16..31 ->  4,4,4,4,...,7,7,7,7)
+        0x08080808, 0x09090909, 0x0A0A0A0A, 0x0B0B0B0B,   // lane 2 (bytes 32..47 ->  8,8,8,8,...,11,11,11,11)
+        0x0C0C0C0C, 0x0D0D0D0D, 0x0E0E0E0E, 0x0F0F0F0F);  // lane 3 (bytes 48..63 -> 12,12,12,12,...,15,15,15,15)
     const __m512i pos0_512 = _mm512_set1_epi32(0x000000FFu);
     const __m512i pos1_512 = _mm512_set1_epi32(0x0000FF00u);
     const __m512i pos2_512 = _mm512_set1_epi32(0x00FF0000u);
