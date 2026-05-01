@@ -2028,230 +2028,17 @@ static void ggml_gemm_q1_0_g128_4x4_q8_0_avx2_4rows(
         }
     }
 }
-
-// Variant of the 4x4 GEMM that consumes the dispatcher-supplied
-// `block_q8_0x4` activation pack directly, deinterleaving each
-// activation row's 32 bytes on the fly via 4 `permutevar8x32` + 3
-// `blend` ops. Functionally equivalent to
-// `ggml_gemm_q1_0_g128_4x4_q8_0_avx2_4rows` but skips the explicit
-// "unpack 4 rows into a scratch `block_q8_0` buffer" pass that the
-// `_4rows` variant relies on. Wired in behind the
-// `GGML_Q1_G128_CHUNKED=1` env var.
-//
-// MEASURED (EPYC 7763 / Zen 3, AVX2-only, 3-run mean):
-//
-//   Variant                | pp256 | pp512 | pp1024
-//   `_4rows` default       | 31.22 | 30.34 | 29.48
-//   `_chunked` (this kern) | 24.76 | 24.27 | 22.96
-//                          ~21% pp regression vs default.
-//
-// Root cause: the deinterleave is 4x permutevar + 3x blend = 7 ops
-// per (sb, r_a). Across the 4x4 inner loop that's 28 extra ops per
-// sub-block, vs the explicit-unpack path which amortises a tight
-// scalar copy across the whole y-group. On Zen 3 the deinterleave
-// cost dominates the unpack savings.
-//
-// Kept in-tree as a documented dead-end so future maintainers (esp.
-// AVX-512 / AVX-VNNI hosts where vpermd is cheaper) have an
-// A/B-ready harness. See `docs/avx2-repack-design/05-drop-unpack-experiment.md`
-// for the full write-up.
-//
-// Layout reminder: each `block_q8_0x4` covers ONE Q8_0 sub-block (32
-// weights) for 4 rows interleaved at 4-byte granularity. Its 128-byte
-// `qs[]` array is laid out as 8 groups x 4 rows x 4 contiguous bytes.
-// Loaded as 4 __m256i (32 bytes each), the i-th vector holds 8 32-bit
-// chunks at lane positions:
-//
-//   ay[k] lane (g_in_pair*4 + r) = chunk for group (2*k + g_in_pair),
-//                                   row r, where g_in_pair in {0,1}.
-//
-// Row r_a's 32-byte qy is [g0_r_a, g1_r_a, ..., g7_r_a]. Extracted
-// via 4x permutevar8x32_epi32 + 3x blend_epi32 per (sb, r_a).
-static void ggml_gemm_q1_0_g128_4x4_q8_0_avx2_chunked(
-        int                            n,
-        float * GGML_RESTRICT          s,
-        size_t                         bs,
-        const block_q1_0_g128x4 * GGML_RESTRICT b_base,
-        const block_q8_0x4 * GGML_RESTRICT      a_pack_base,
-        int                            nc) {
-    const int qk                = QK8_0;
-    const int nb_q8             = n / qk;
-    const int nb                = nb_q8 / 4;
-    const int ncols_interleaved = 4;
-
-    assert(n % QK1_0_g128 == 0);
-    assert(nc % ncols_interleaved == 0);
-
-    const __m256i shuffle_mask = _mm256_set_epi8(
-        3, 3, 3, 3, 3, 3, 3, 3,
-        2, 2, 2, 2, 2, 2, 2, 2,
-        1, 1, 1, 1, 1, 1, 1, 1,
-        0, 0, 0, 0, 0, 0, 0, 0);
-    const __m256i bit_mask = _mm256_set_epi8(
-        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
-        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
-        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
-        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
-    const __m256i ones_b = _mm256_set1_epi8(1);
-    const __m256i ones_w = _mm256_set1_epi16(1);
-    const __m256i zero   = _mm256_setzero_si256();
-
-    // Per-row 32-bit gather indices for `_mm256_permutevar8x32_epi32`.
-    // `idx_r[r_a]` puts row r_a's chunk for group (2*k) at output lane 0
-    // and chunk for group (2*k+1) at output lane 1, when applied to the
-    // k-th __m256i ay-load (k in {0,1,2,3}). Other output lanes are
-    // intentionally garbage; they are blended away below.
-    const __m256i idx_r[4] = {
-        _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0),
-        _mm256_setr_epi32(1, 5, 0, 0, 0, 0, 0, 0),
-        _mm256_setr_epi32(2, 6, 0, 0, 0, 0, 0, 0),
-        _mm256_setr_epi32(3, 7, 0, 0, 0, 0, 0, 0),
-    };
-    // Same shape, but with the chunk pair routed to output lanes
-    // 2,3 / 4,5 / 6,7 respectively (one per ay-load index k).
-    const __m256i idx_r_k1[4] = {
-        _mm256_setr_epi32(0, 0, 0, 4, 0, 0, 0, 0),
-        _mm256_setr_epi32(0, 0, 1, 5, 0, 0, 0, 0),
-        _mm256_setr_epi32(0, 0, 2, 6, 0, 0, 0, 0),
-        _mm256_setr_epi32(0, 0, 3, 7, 0, 0, 0, 0),
-    };
-    const __m256i idx_r_k2[4] = {
-        _mm256_setr_epi32(0, 0, 0, 0, 0, 4, 0, 0),
-        _mm256_setr_epi32(0, 0, 0, 0, 1, 5, 0, 0),
-        _mm256_setr_epi32(0, 0, 0, 0, 2, 6, 0, 0),
-        _mm256_setr_epi32(0, 0, 0, 0, 3, 7, 0, 0),
-    };
-    const __m256i idx_r_k3[4] = {
-        _mm256_setr_epi32(0, 0, 0, 0, 0, 0, 0, 4),
-        _mm256_setr_epi32(0, 0, 0, 0, 0, 0, 1, 5),
-        _mm256_setr_epi32(0, 0, 0, 0, 0, 0, 2, 6),
-        _mm256_setr_epi32(0, 0, 0, 0, 0, 0, 3, 7),
-    };
-
-    for (int x = 0; x < nc / ncols_interleaved; x++) {
-        const block_q1_0_g128x4 * b_ptr = b_base + (size_t) x * nb;
-
-        __m256 acc[4][4];
-        for (int r_a = 0; r_a < 4; r_a++) {
-            for (int r_w = 0; r_w < 4; r_w++) {
-                acc[r_a][r_w] = _mm256_setzero_ps();
-            }
-        }
-
-        for (int ib = 0; ib < nb; ib++) {
-            const __m128 d_w = _mm_cvtph_ps(
-                _mm_loadl_epi64((const __m128i *) &b_ptr[ib].d[0]));
-            alignas(16) float d_w_arr[4];
-            _mm_store_ps(d_w_arr, d_w);
-
-            for (int sb = 0; sb < 4; sb++) {
-                // Same per-sub-block weight bit-expansion as the
-                // _4rows variant: shared across all 4 activation rows.
-                const __m128i qbits_4rows = _mm_loadu_si128(
-                    (const __m128i *) &b_ptr[ib].qs[sb * 16]);
-                const uint32_t qbits_w[4] = {
-                    (uint32_t) _mm_extract_epi32(qbits_4rows, 0),
-                    (uint32_t) _mm_extract_epi32(qbits_4rows, 1),
-                    (uint32_t) _mm_extract_epi32(qbits_4rows, 2),
-                    (uint32_t) _mm_extract_epi32(qbits_4rows, 3),
-                };
-
-                __m256i mask_w[4];
-                for (int r_w = 0; r_w < 4; r_w++) {
-                    const __m128i qb128  = _mm_set1_epi32((int) qbits_w[r_w]);
-                    const __m256i qb256  = _mm256_broadcastsi128_si256(qb128);
-                    const __m256i shuf   = _mm256_shuffle_epi8(qb256, shuffle_mask);
-                    const __m256i tested = _mm256_and_si256(shuf, bit_mask);
-                    mask_w[r_w]          = _mm256_cmpeq_epi8(tested, bit_mask);
-                }
-
-                // Activations: load all 4 ay-vectors for this (ib, sb)
-                // block_q8_0x4 ONCE, then deinterleave per row.
-                const block_q8_0x4 * a_blk = &a_pack_base[ib * 4 + sb];
-                const __m256i ay[4] = {
-                    _mm256_loadu_si256((const __m256i *) &a_blk->qs[0]),
-                    _mm256_loadu_si256((const __m256i *) &a_blk->qs[32]),
-                    _mm256_loadu_si256((const __m256i *) &a_blk->qs[64]),
-                    _mm256_loadu_si256((const __m256i *) &a_blk->qs[96]),
-                };
-
-                // Activation deltas: 4 FP16 values, one per row.
-                alignas(16) float d_y_arr[4];
-                _mm_store_ps(d_y_arr, _mm_cvtph_ps(
-                    _mm_loadl_epi64((const __m128i *) &a_blk->d[0])));
-
-                for (int r_a = 0; r_a < 4; r_a++) {
-                    // Deinterleave row r_a from the 4 ay-vectors.
-                    // Each permutevar puts the row's two-chunk pair at
-                    // a specific output lane pair; blend stitches them
-                    // into a contiguous 32-byte row.
-                    const __m256i p0 = _mm256_permutevar8x32_epi32(ay[0], idx_r[r_a]);
-                    const __m256i p1 = _mm256_permutevar8x32_epi32(ay[1], idx_r_k1[r_a]);
-                    const __m256i p2 = _mm256_permutevar8x32_epi32(ay[2], idx_r_k2[r_a]);
-                    const __m256i p3 = _mm256_permutevar8x32_epi32(ay[3], idx_r_k3[r_a]);
-
-                    __m256i qy = _mm256_blend_epi32(p0, p1, 0x0C);  // lanes 2,3 from p1
-                    qy         = _mm256_blend_epi32(qy, p2, 0x30);  // lanes 4,5 from p2
-                    qy         = _mm256_blend_epi32(qy, p3, 0xC0);  // lanes 6,7 from p3
-
-                    const float d_y = d_y_arr[r_a];
-
-                    const __m256i sum_qy_v = _mm256_madd_epi16(
-                        _mm256_maddubs_epi16(ones_b, qy), ones_w);
-
-                    for (int r_w = 0; r_w < 4; r_w++) {
-                        const __m256i masked = _mm256_blendv_epi8(zero, qy, mask_w[r_w]);
-                        const __m256i partial = _mm256_madd_epi16(
-                            _mm256_maddubs_epi16(ones_b, masked), ones_w);
-                        const __m256i row_dot = _mm256_sub_epi32(
-                            _mm256_slli_epi32(partial, 1), sum_qy_v);
-
-                        acc[r_a][r_w] = _mm256_fmadd_ps(
-                            _mm256_set1_ps(d_w_arr[r_w] * d_y),
-                            _mm256_cvtepi32_ps(row_dot),
-                            acc[r_a][r_w]);
-                    }
-                }
-            }
-        }
-
-        for (int r_a = 0; r_a < 4; r_a++) {
-            for (int r_w = 0; r_w < 4; r_w++) {
-                s[r_a * bs + x * ncols_interleaved + r_w] =
-                    gemv_q1_0_g128_hsum_float_8(acc[r_a][r_w]);
-            }
-        }
-    }
-}
 #endif // __AVX2__
-
-// True if `GGML_Q1_G128_CHUNKED` is set to a non-zero value at process
-// start. Cached on first call to avoid `getenv` on every matmul.
-static bool ggml_q1_g128_chunked_enabled() {
-    static const bool v = []() {
-        const char * s = std::getenv("GGML_Q1_G128_CHUNKED");
-        return s != nullptr && s[0] != '\0' && s[0] != '0';
-    }();
-    return v;
-}
 
 void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     // The repack tensor_traits<..., INTER_SIZE=4, ..., GGML_TYPE_Q8_0>
     // dispatcher quantises src1 with `ggml_quantize_mat_q8_0_4x4`, which
     // produces a 4-row interleaved `block_q8_0x4` buffer (see
-    // `repack.cpp:51`). Two AVX2 inner kernels are available:
-    //
-    //   * `_4rows` (default): unpacks 4 rows ONCE per y group into a
-    //     contiguous scratch buffer, then walks the weights once
-    //     sharing the per-sub-block bit expansion across all 4
-    //     activation rows. Shipped in PR #13.
-    //
-    //   * `_chunked` (opt-in via `GGML_Q1_G128_CHUNKED=1`): consumes
-    //     `block_q8_0x4` directly, deinterleaving each row's 32 bytes
-    //     on the fly via 4x permutevar + 3x blend per (sb, r_a). No
-    //     scratch buffer; lower L1 footprint. Whether the deinterleave
-    //     overhead beats the explicit unpack on Zen 3 / AVX2-only is a
-    //     measured property -- the env var lets llama-bench A/B both.
+    // `repack.cpp:51`). My GEMV consumes plain `block_q8_0`, so the GEMM
+    // unpacks 4 activation rows ONCE per y group into a contiguous
+    // scratch buffer, then runs a 4x4 inner kernel that walks the
+    // `block_q1_0_g128x4` weights once and shares the per-sub-block bit
+    // expansion across all 4 activation rows.
     //
     // `bs` is the FP32 output row stride in **float elements** (it's
     // `nb1 / nb0` from `forward_mul_mat_one_chunk`, with `nb0 =
@@ -2264,28 +2051,10 @@ void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, con
     assert(nc % 4 == 0);
     assert(n % QK1_0_g128 == 0);
 
-    const block_q8_0x4 * a_pack_base = (const block_q8_0x4 *) vy;
-
-#if defined(__AVX2__)
-    if (ggml_q1_g128_chunked_enabled()) {
-        const block_q1_0_g128x4 * b_base = (const block_q1_0_g128x4 *) vx;
-        for (int y = 0; y < nr / 4; y++) {
-            ggml_gemm_q1_0_g128_4x4_q8_0_avx2_chunked(
-                n,
-                s + (size_t) (y * 4) * bs, bs,
-                b_base,
-                a_pack_base + (size_t) y * nb_q8,
-                nc);
-        }
-        return;
-    }
-#endif
-
-    // Default path: explicit unpack + _4rows kernel.
-    //
     // 4 row buffers, allocated once per call (not per y group). Each row
     // holds `nb_q8` block_q8_0 instances = 36 B/block * nb_q8.
     std::vector<block_q8_0> unpacked((size_t) nb_q8 * 4);
+    const block_q8_0x4 * a_pack_base = (const block_q8_0x4 *) vy;
 
     for (int y = 0; y < nr / 4; y++) {
         const block_q8_0x4 * a_pack = a_pack_base + (size_t) y * nb_q8;
