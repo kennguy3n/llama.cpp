@@ -1,0 +1,64 @@
+Phase 3 end-to-end llama-bench results: Q1_0_g128 4x4 AVX2 repack on Zen 3.
+Companion to baseline-zen3-epyc-7763.txt (Phase 2 microbench harness).
+
+Host:
+  AMD EPYC 7763 (Zen 3, AVX2 only, no AVX-512), 4 vCPU, 8 GiB RAM
+  Linux 6.x, GCC, -DCMAKE_BUILD_TYPE=Release, -DGGML_CPU_REPACK=ON
+  llama.cpp commit 235e877d (prism branch + Phase 3 changes uncommitted)
+
+Model:
+  Bonsai-1.7B Q1_0_g128, 248302272 B (231.13 MiB)
+  Path: /home/ubuntu/repos/cv-guard/models/slm/Bonsai-1.7B.gguf
+  No GGUF format change; runtime repack happens at tensor allocation time.
+
+Methodology:
+  llama-bench, default warmup, -r 3 / -r 5 (medians shown as t/s ± stdev)
+  A/B: same binary, same model, same flags. Baseline run from a `git stash`
+  of the Phase 3 changes; repack run from the working tree with all changes
+  applied. Both runs done back-to-back on a quiet VM.
+
+Results (-t 4):
+
+  Variant                         | pp512 (t/s)    | tg64 (t/s)
+  --------------------------------|---------------:|-----------:
+  Existing single-row AVX2 path   | 22.62 ± 0.04   | n/a (not run)
+  Phase 3 4x4 GEMV (AVX2 repack)  | 27.03 ± 0.18   | 20.33 ± 0.07
+
+  Speedup: 27.03 / 22.62 = 1.195x prefill (Phase 2 microbench projected 1.28x;
+  the gap is consistent with the rest of the prefill graph not benefiting from
+  the kernel change - attention, RMS norms, ROPE, embedding lookups, etc.).
+
+Results (-t 8):
+
+  Variant                         | pp512 (t/s)    | tg64 (t/s)
+  --------------------------------|---------------:|-----------:
+  Phase 3 4x4 GEMV (AVX2 repack)  | 26.47 ± 0.03   |  9.58 ± 0.07
+
+  TG drops at higher thread count, expected on a 4 vCPU VM (oversubscription).
+
+Parity:
+
+  tests/test-q1-g128-repack-parity.cpp (synthetic 4 rows x 512 weights):
+    row 0: ref=-1.160062 got=-1.160062 diff=0.000000e+00
+    row 1: ref=-9.720197 got=-9.720197 diff=0.000000e+00
+    row 2: ref=-0.389762 got=-0.389762 diff=0.000000e+00
+    row 3: ref= 8.686262 got= 8.686262 diff=0.000000e+00
+  All 50 ctest targets pass (-DLLAMA_BUILD_TESTS=ON).
+
+Dispatcher gate:
+
+  Q1_0_g128 only opts into the runtime repack on hosts where AVX2 is
+  available AND AVX-512 is not. AVX-512 hosts retain the existing
+  single-row path in arch/x86/quants.c (which uses VNNI-style mask blends
+  via mmask32 + dpbusd and is faster than the 4x4 repack). NEON / RISC-V /
+  Metal / CUDA / Vulkan paths are untouched - they continue to use the
+  single-row vec_dot from quants.c.
+
+Next steps:
+
+  - AVX-VNNI (Alder Lake P-cores, Zen 4) "Kernel B" variant; deferred
+    until a target host is available for measurement (qemu/SDE will not
+    give meaningful timings).
+  - Optional: 8-row interleave on AVX-512 hosts where the existing
+    single-row path is already optimal - low priority, possibly not worth
+    the GGUF complexity.

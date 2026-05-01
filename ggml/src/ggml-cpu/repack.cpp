@@ -1994,6 +1994,97 @@ void ggml_gemm_q8_0_4x8_q8_0_generic(int                        n,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Q1_0_g128 4-row interleaved GEMV / GEMM (Phase 3 of the AVX2 repack project,
+// PR #12 on prism). The packed layout matches `block_q1_0_g128x4` in
+// `repack.h`: 4 ggml_half deltas followed by 4 sub-blocks of 16 bytes each,
+// with 4-byte interleave granularity per row inside each sub-block.
+//
+// `n` is the inner dimension (i.e. the number of weights per row, equal to
+// `ne00` in mainline ggml notation). Each `block_q1_0_g128x4` covers 128
+// weights per row across 4 rows; each activation column has 4 `block_q8_0`
+// (32 weights each) per Q1_0_g128 block.
+// ---------------------------------------------------------------------------
+
+void ggml_gemv_q1_0_g128_4x4_q8_0_generic(int                        n,
+                                          float * GGML_RESTRICT      s,
+                                          size_t                     bs,
+                                          const void * GGML_RESTRICT vx,
+                                          const void * GGML_RESTRICT vy,
+                                          int                        nr,
+                                          int                        nc) {
+    const int qk                = QK8_0;
+    const int nb_q8             = n / qk;            // number of Q8_0 blocks per src1 column
+    const int nb                = nb_q8 / 4;         // number of Q1_0_g128x4 blocks per row group
+    const int ncols_interleaved = 4;
+
+    assert(nr == 1);
+    assert(n % QK1_0_g128 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_q1_0_g128x4 * b_ptr = (const block_q1_0_g128x4 *) vx + (x * nb);
+
+        float sumf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int ib = 0; ib < nb; ib++) {
+            float drow[4];
+            for (int r = 0; r < 4; r++) {
+                drow[r] = GGML_CPU_FP16_TO_FP32(b_ptr[ib].d[r]);
+            }
+            for (int k = 0; k < 4; k++) {
+                const float dy = GGML_CPU_FP16_TO_FP32(a_ptr[ib*4 + k].d);
+                for (int r = 0; r < 4; r++) {
+                    int sumi = 0;
+                    // per-row, per-sub-block 4 packed bytes -> 32 ±1 weights
+                    const int qs_off = k * 16 + r * 4;
+                    for (int j = 0; j < QK8_0; j++) {
+                        const int byte_index = qs_off + (j / 8);
+                        const int bit_offset = j % 8;
+                        const int bit        = (b_ptr[ib].qs[byte_index] >> bit_offset) & 1;
+                        const int xi         = bit ? 1 : -1;
+                        sumi += xi * (int) a_ptr[ib*4 + k].qs[j];
+                    }
+                    sumf[r] += drow[r] * dy * (float) sumi;
+                }
+            }
+        }
+        for (int r = 0; r < 4; r++) {
+            s[x * ncols_interleaved + r] = sumf[r];
+        }
+    }
+}
+
+void ggml_gemm_q1_0_g128_4x4_q8_0_generic(int                        n,
+                                          float * GGML_RESTRICT      s,
+                                          size_t                     bs,
+                                          const void * GGML_RESTRICT vx,
+                                          const void * GGML_RESTRICT vy,
+                                          int                        nr,
+                                          int                        nc) {
+    // Generic GEMM = looped GEMV over `nr` activation rows. The per-call
+    // 1.28x win still applies on every row; what we DON'T get here is the
+    // amortisation of weight loads across 4 src1 columns (which would
+    // require a true 4x4 GEMM kernel and isn't measured by Phase 2).
+    const int qk    = QK8_0;
+    const int nb_q8 = n / qk;
+    const size_t src1_col_stride = (size_t) nb_q8 * sizeof(block_q8_0);
+    const size_t bs_floats = bs / sizeof(float);
+
+    assert(n % QK1_0_g128 == 0);
+    assert(nc % 4 == 0);
+
+    for (int row = 0; row < nr; row++) {
+        const void * vy_col = (const char *) vy + (size_t) row * src1_col_stride;
+        ggml_gemv_q1_0_g128_4x4_q8_0(n, s + (size_t) row * bs_floats, bs, vx,
+                                     vy_col, /* nr = */ 1, nc);
+    }
+}
+
 } // extern "C"
 
 static block_q8_0x4 make_block_q8_0x4(block_q8_0 * in, unsigned int blck_size_interleave) {
@@ -2674,6 +2765,60 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
     GGML_UNUSED(data_size);
 }
 
+// Phase 3: 4-row interleave of `block_q1_0_g128`. The on-disk byte layout is
+// described in `repack.h:block_q1_0_g128x4` and reproduced here for grep-ability:
+//
+//   [d0 d1 d2 d3]                  // 8 B: 4 ggml_half deltas
+//   [r0_sb_k r1_sb_k r2_sb_k r3_sb_k] (k = 0..3)  // 4 sub-blocks × 16 B
+//
+// Sub-block k contains 32 packed weight bits per row (4 bytes per row), aligned
+// to the 4-row q8_0 sub-blocks consumed by Kernel A in the microbench harness.
+static block_q1_0_g128x4 make_block_q1_0_g128x4(block_q1_0_g128 * in) {
+    block_q1_0_g128x4 out;
+    for (int r = 0; r < 4; r++) {
+        out.d[r] = in[r].d;
+    }
+    for (int k = 0; k < 4; k++) {
+        for (int r = 0; r < 4; r++) {
+            memcpy(&out.qs[k * 16 + r * 4], &in[r].qs[k * 4], 4);
+        }
+    }
+    return out;
+}
+
+static int repack_q1_0_g128_to_q1_0_g128_4_bl(struct ggml_tensor * t, int interleave_block,
+                                              const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q1_0_g128);
+    GGML_ASSERT(interleave_block == 4);
+
+    constexpr int  nrows_interleaved = 4;
+    constexpr int  bytes_per_block   = (int) sizeof(block_q1_0_g128);
+
+    const block_q1_0_g128   * src = (const block_q1_0_g128 *) data;
+          block_q1_0_g128x4 * dst = (block_q1_0_g128x4    *) t->data;
+
+    block_q1_0_g128 dst_tmp[nrows_interleaved];
+
+    const int     nrow    = ggml_nrows(t);
+    const int64_t nblocks = t->ne[0] / QK1_0_g128;
+
+    GGML_ASSERT(data_size == (size_t) nrow * (size_t) nblocks * (size_t) bytes_per_block);
+
+    if (t->ne[1] % nrows_interleaved != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                dst_tmp[i] = src[x + i * nblocks];
+            }
+            *dst++ = make_block_q1_0_g128x4(dst_tmp);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+}
 
 static block_mxfp4x4 make_block_mxfp4x4(block_mxfp4 * in, unsigned int blck_size_interleave) {
     block_mxfp4x4 out;
@@ -2864,6 +3009,10 @@ template <> int repack<block_q8_0, 8, 4>(struct ggml_tensor * t, const void * da
     return repack_q8_0_to_q8_0_4_bl(t, 8, data, data_size);
 }
 
+template <> int repack<block_q1_0_g128, 4, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_q1_0_g128_to_q1_0_g128_4_bl(t, 4, data, data_size);
+}
+
 // gemv
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
 void gemv(int, float *, size_t, const void *, const void *, int, int);
@@ -2939,6 +3088,10 @@ template <> void gemv<block_q8_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
     ggml_gemv_q8_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+template <> void gemv<block_q1_0_g128, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q1_0_g128_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
 // gemm
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
 void gemm(int, float *, size_t, const void *, const void *, int, int);
@@ -3012,6 +3165,10 @@ template <> void gemm<block_q8_0, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
 
 template <> void gemm<block_q8_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_q8_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_q1_0_g128, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q1_0_g128_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
 class tensor_traits_base : public ggml::cpu::tensor_traits {
@@ -3422,6 +3579,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_0_4x8_q8_0;
 
+    // instance for Q1_0_g128 (Phase 3 AVX2 repack, see docs/avx2-repack-design/)
+    static const ggml::cpu::repack::tensor_traits<block_q1_0_g128, 4, 4, GGML_TYPE_Q8_0> q1_0_g128_4x4_q8_0;
+
     if (cur->type == GGML_TYPE_Q4_0) {
         if (ggml_cpu_has_avx2() || (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)
             || (ggml_cpu_has_riscv_v() && (ggml_cpu_get_rvv_vlen() >= QK4_0))) {
@@ -3514,6 +3674,17 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
             if (cur->ne[1] % 4 == 0) {
                 return &q8_0_4x4_q8_0;
+            }
+        }
+    } else if (cur->type == GGML_TYPE_Q1_0_g128) {
+        // Q1_0_g128 already has a hand-tuned single-row AVX-512 path in
+        // ggml/src/ggml-cpu/arch/x86/quants.c that beats the 4-row repack
+        // wherever AVX-512BW is available. Only opt into the runtime
+        // repack on hosts where that fast path is unavailable, i.e. AVX2
+        // (with or without AVX-VNNI) but no AVX-512.
+        if (ggml_cpu_has_avx2() && !ggml_cpu_has_avx512()) {
+            if (cur->ne[1] % 4 == 0) {
+                return &q1_0_g128_4x4_q8_0;
             }
         }
     }
