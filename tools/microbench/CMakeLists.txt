@@ -23,6 +23,18 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|x86")
     if (LLAMA_MICROBENCH_AVX_VNNI)
         target_compile_options(${TARGET} PRIVATE -mavxvnni)
     endif()
+
+    # Follow-up #3: opt-in AVX-512BW+VL+VNNI build for Kernel C
+    # (proposed AVX-512 VNNI 4x4 GEMV/GEMM). Validate via Intel SDE
+    # `-clx` (Cascade Lake) / `-icx` (Ice Lake) on Zen 3 hosts that
+    # don't have native AVX-512.
+    option(LLAMA_MICROBENCH_AVX512_VNNI
+        "Enable AVX-512BW+VL+VNNI in the q1_g128 microbench (Cascade Lake, Ice Lake, Sapphire Rapids, Zen 4)"
+        OFF)
+    if (LLAMA_MICROBENCH_AVX512_VNNI)
+        target_compile_options(${TARGET} PRIVATE
+            -mavx512f -mavx512bw -mavx512vl -mavx512vnni)
+    endif()
 endif()
 
 if(LLAMA_TOOLS_INSTALL)
