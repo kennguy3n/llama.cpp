@@ -1861,8 +1861,118 @@ static void ggml_gemv_q1_0_g128_4x4_q8_0_avx2(int                        n,
 }
 #endif // __AVX2__
 
+#if defined(__AVXVNNI__)
+// AVX-VNNI variant of the 4-row GEMV (Kernel B from the design brief).
+// Outer skeleton matches the AVX2 version above; the per-row body
+// collapses the explicit `+-1` reduction
+//   partial = madd(maddubs(ones, qy_bit_masked), ones)
+//   row_dot = 2*partial - sum_qy
+// into a single signed-byte dot product:
+//   signed_qy = blendv(neg_qy, qy, mask_ff)   // +qy where bit=1, -qy where bit=0
+//   int_acc   = dpbusd(zero, ones_b, signed_qy)
+//
+// Output is bit-identical to the AVX2 path: both compute
+//   sum_lane(+-qy) where the sign per byte is determined by the same
+//   bit-mask of `qbits`. Verified by SDE Alder Lake parity test.
+//
+// Compiled in only when `__AVXVNNI__` is defined (Alder Lake P-cores,
+// Sapphire Rapids, Zen 4). On AVX2-only Zen 3 hosts this code is
+// omitted at compile time and the AVX2 GEMV above remains the fast
+// path.
+static void ggml_gemv_q1_0_g128_4x4_q8_0_avx_vnni(int                        n,
+                                                  float * GGML_RESTRICT      s,
+                                                  size_t                     bs,
+                                                  const void * GGML_RESTRICT vx,
+                                                  const void * GGML_RESTRICT vy,
+                                                  int                        nr,
+                                                  int                        nc) {
+    const int qk                = QK8_0;
+    const int nb_q8             = n / qk;
+    const int nb                = nb_q8 / 4;
+    const int ncols_interleaved = 4;
+
+    assert(nr == 1);
+    assert(n % QK1_0_g128 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    const __m256i shuffle_mask = _mm256_set_epi8(
+        3, 3, 3, 3, 3, 3, 3, 3,
+        2, 2, 2, 2, 2, 2, 2, 2,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 0, 0, 0, 0, 0, 0, 0);
+    const __m256i bit_mask = _mm256_set_epi8(
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    const __m256i ones_b = _mm256_set1_epi8(1);
+    const __m256i zero   = _mm256_setzero_si256();
+
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_q1_0_g128x4 * b_ptr = (const block_q1_0_g128x4 *) vx + (x * nb);
+
+        __m256 acc[4] = {
+            _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(), _mm256_setzero_ps(),
+        };
+
+        for (int ib = 0; ib < nb; ib++) {
+            const __m128 d_rows = _mm_cvtph_ps(
+                _mm_loadl_epi64((const __m128i *) &b_ptr[ib].d[0]));
+            alignas(16) float d_rows_arr[4];
+            _mm_store_ps(d_rows_arr, d_rows);
+
+            for (int k = 0; k < 4; k++) {
+                const __m256i qy = _mm256_loadu_si256(
+                    (const __m256i *) a_ptr[ib * 4 + k].qs);
+                const float d_y = GGML_CPU_FP16_TO_FP32(a_ptr[ib * 4 + k].d);
+                const __m256i neg_qy = _mm256_sub_epi8(zero, qy);
+
+                const __m128i qbits_4rows = _mm_loadu_si128(
+                    (const __m128i *) &b_ptr[ib].qs[k * 16]);
+                const uint32_t qbits_w[4] = {
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 0),
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 1),
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 2),
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 3),
+                };
+
+                for (int r = 0; r < 4; r++) {
+                    const __m128i qb128   = _mm_set1_epi32((int) qbits_w[r]);
+                    const __m256i qb256   = _mm256_broadcastsi128_si256(qb128);
+                    const __m256i shuf    = _mm256_shuffle_epi8(qb256, shuffle_mask);
+                    const __m256i tested  = _mm256_and_si256(shuf, bit_mask);
+                    const __m256i mask_ff = _mm256_cmpeq_epi8(tested, bit_mask);
+
+                    const __m256i signed_qy = _mm256_blendv_epi8(neg_qy, qy, mask_ff);
+                    const __m256i int_acc   = _mm256_dpbusd_avx_epi32(
+                        zero, ones_b, signed_qy);
+
+                    acc[r] = _mm256_fmadd_ps(
+                        _mm256_set1_ps(d_rows_arr[r] * d_y),
+                        _mm256_cvtepi32_ps(int_acc),
+                        acc[r]);
+                }
+            }
+        }
+
+        for (int r = 0; r < 4; r++) {
+            s[x * ncols_interleaved + r] = gemv_q1_0_g128_hsum_float_8(acc[r]);
+        }
+    }
+}
+#endif // __AVXVNNI__
+
 void ggml_gemv_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-#if defined(__AVX2__)
+#if defined(__AVXVNNI__)
+    ggml_gemv_q1_0_g128_4x4_q8_0_avx_vnni(n, s, bs, vx, vy, nr, nc);
+    return;
+#elif defined(__AVX2__)
     ggml_gemv_q1_0_g128_4x4_q8_0_avx2(n, s, bs, vx, vy, nr, nc);
     return;
 #endif
@@ -2030,6 +2140,122 @@ static void ggml_gemm_q1_0_g128_4x4_q8_0_avx2_4rows(
 }
 #endif // __AVX2__
 
+#if defined(__AVXVNNI__)
+// AVX-VNNI variant of the true 4x4 GEMM (Kernel B from the design
+// brief). Outer skeleton matches the AVX2 4-rows GEMM above; the per-
+// (r_a, r_w) inner body collapses
+//   masked  = blendv(zero, qy, mask_w[r_w])
+//   partial = madd(maddubs(ones, masked), ones)
+//   row_dot = 2*partial - sum_qy_v
+// into a single signed-byte dot product:
+//   signed_qy = blendv(neg_qy, qy, mask_w[r_w])
+//   int_acc   = dpbusd(zero, ones_b, signed_qy)
+// This drops `sum_qy_v` (no longer needed), `slli`, and one of the
+// `madd*` chain ops per (r_a, r_w) per sub-block. The mask_w[r_w]
+// expansion is still amortised across all 4 activation rows -- the
+// register pressure profile is identical to the AVX2 path.
+//
+// Output is bit-identical to the AVX2 path: both compute
+//   sum_lane(+-qy) per (r_a, r_w) where the sign per byte is
+//   determined by the same bit-mask of `qbits`. Verified by SDE
+//   Alder Lake parity test.
+//
+// Compiled in only when `__AVXVNNI__` is defined.
+static void ggml_gemm_q1_0_g128_4x4_q8_0_avx_vnni_4rows(
+        int                            n,
+        float * GGML_RESTRICT          s,
+        size_t                         bs,
+        const block_q1_0_g128x4 * GGML_RESTRICT b_base,
+        const block_q8_0 * GGML_RESTRICT a_rows[4],
+        int                            nc) {
+    const int qk                = QK8_0;
+    const int nb_q8             = n / qk;
+    const int nb                = nb_q8 / 4;
+    const int ncols_interleaved = 4;
+
+    assert(n % QK1_0_g128 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    const __m256i shuffle_mask = _mm256_set_epi8(
+        3, 3, 3, 3, 3, 3, 3, 3,
+        2, 2, 2, 2, 2, 2, 2, 2,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 0, 0, 0, 0, 0, 0, 0);
+    const __m256i bit_mask = _mm256_set_epi8(
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    const __m256i ones_b = _mm256_set1_epi8(1);
+    const __m256i zero   = _mm256_setzero_si256();
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_q1_0_g128x4 * b_ptr = b_base + (size_t) x * nb;
+
+        __m256 acc[4][4];
+        for (int r_a = 0; r_a < 4; r_a++) {
+            for (int r_w = 0; r_w < 4; r_w++) {
+                acc[r_a][r_w] = _mm256_setzero_ps();
+            }
+        }
+
+        for (int ib = 0; ib < nb; ib++) {
+            const __m128 d_w = _mm_cvtph_ps(
+                _mm_loadl_epi64((const __m128i *) &b_ptr[ib].d[0]));
+            alignas(16) float d_w_arr[4];
+            _mm_store_ps(d_w_arr, d_w);
+
+            for (int sb = 0; sb < 4; sb++) {
+                const __m128i qbits_4rows = _mm_loadu_si128(
+                    (const __m128i *) &b_ptr[ib].qs[sb * 16]);
+                const uint32_t qbits_w[4] = {
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 0),
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 1),
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 2),
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 3),
+                };
+
+                __m256i mask_w[4];
+                for (int r_w = 0; r_w < 4; r_w++) {
+                    const __m128i qb128  = _mm_set1_epi32((int) qbits_w[r_w]);
+                    const __m256i qb256  = _mm256_broadcastsi128_si256(qb128);
+                    const __m256i shuf   = _mm256_shuffle_epi8(qb256, shuffle_mask);
+                    const __m256i tested = _mm256_and_si256(shuf, bit_mask);
+                    mask_w[r_w]          = _mm256_cmpeq_epi8(tested, bit_mask);
+                }
+
+                for (int r_a = 0; r_a < 4; r_a++) {
+                    const __m256i qy = _mm256_loadu_si256(
+                        (const __m256i *) a_rows[r_a][ib * 4 + sb].qs);
+                    const float d_y =
+                        GGML_CPU_FP16_TO_FP32(a_rows[r_a][ib * 4 + sb].d);
+                    const __m256i neg_qy = _mm256_sub_epi8(zero, qy);
+
+                    for (int r_w = 0; r_w < 4; r_w++) {
+                        const __m256i signed_qy = _mm256_blendv_epi8(
+                            neg_qy, qy, mask_w[r_w]);
+                        const __m256i int_acc = _mm256_dpbusd_avx_epi32(
+                            zero, ones_b, signed_qy);
+
+                        acc[r_a][r_w] = _mm256_fmadd_ps(
+                            _mm256_set1_ps(d_w_arr[r_w] * d_y),
+                            _mm256_cvtepi32_ps(int_acc),
+                            acc[r_a][r_w]);
+                    }
+                }
+            }
+        }
+
+        for (int r_a = 0; r_a < 4; r_a++) {
+            for (int r_w = 0; r_w < 4; r_w++) {
+                s[r_a * bs + x * ncols_interleaved + r_w] =
+                    gemv_q1_0_g128_hsum_float_8(acc[r_a][r_w]);
+            }
+        }
+    }
+}
+#endif // __AVXVNNI__
+
 void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     // The repack tensor_traits<..., INTER_SIZE=4, ..., GGML_TYPE_Q8_0>
     // dispatcher quantises src1 with `ggml_quantize_mat_q8_0_4x4`, which
@@ -2074,10 +2300,17 @@ void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, con
         const block_q8_0 * a_rows_const[4] = {
             row_bufs[0], row_bufs[1], row_bufs[2], row_bufs[3]
         };
+#  if defined(__AVXVNNI__)
+        ggml_gemm_q1_0_g128_4x4_q8_0_avx_vnni_4rows(
+            n,
+            s + (size_t) (y * 4) * bs, bs,
+            b_base, a_rows_const, nc);
+#  else
         ggml_gemm_q1_0_g128_4x4_q8_0_avx2_4rows(
             n,
             s + (size_t) (y * 4) * bs, bs,
             b_base, a_rows_const, nc);
+#  endif
 #else
         // Generic fallback: 4 sequential GEMV calls.
         for (int r = 0; r < 4; r++) {

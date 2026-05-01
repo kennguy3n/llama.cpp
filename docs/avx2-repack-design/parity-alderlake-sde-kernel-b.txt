@@ -1,0 +1,42 @@
+# Q1_0_g128 4x4 AVX-VNNI parity check under Intel SDE (-adl, Alder Lake)
+#
+# Build:
+#   cmake -B build-vnni -G Ninja \
+#       -DCMAKE_BUILD_TYPE=Release \
+#       -DGGML_NATIVE=OFF \
+#       -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+#       -DGGML_BMI2=ON -DGGML_AVX_VNNI=ON \
+#       -DLLAMA_BUILD_TESTS=ON
+#   cmake --build build-vnni -j --target test-q1-g128-repack-parity
+#
+# Run (Intel SDE 9.48.0 in PATH):
+#   sde64 -adl -- ./build-vnni/bin/test-q1-g128-repack-parity
+#
+# Host: AMD EPYC 7763 (Zen 3, no native AVX-VNNI). SDE dynamically
+# translates vpdpbusd_avx into host-native sequences, so this run
+# proves correctness only -- timing under SDE is meaningless and
+# is not measured here.
+#
+# Disassembly check:
+#   objdump -d build-vnni/bin/libggml-cpu.so | grep -c vpdpbusd
+#       => 506   (Kernel B emitted; both GEMV + GEMM 4-rows variants
+#                 inlined into the public dispatchers)
+#
+# === Output ===
+
+Test 1: GEMV (nr=1)
+  GEMV row 0: ref=-1.160062 got=-1.160062 diff= 0.000000e+00 OK
+  GEMV row 1: ref=-9.720197 got=-9.720197 diff= 0.000000e+00 OK
+  GEMV row 2: ref=-0.389762 got=-0.389762 diff= 0.000000e+00 OK
+  GEMV row 3: ref= 8.686262 got= 8.686262 diff= 0.000000e+00 OK
+Test 2: GEMM (nr=4)
+  GEMM[nr=4] elem 0 (row 0, col 0): ref= 7.289342 got= 7.289342 diff= 0.000000e+00 OK
+  GEMM[nr=4] elem 1 (row 0, col 1): ref= 1.069002 got= 1.069002 diff= 0.000000e+00 OK
+  GEMM[nr=4] elem 2 (row 0, col 2): ref=-1.295987 got=-1.295987 diff= 0.000000e+00 OK
+  GEMM[nr=4] elem 3 (row 0, col 3): ref= 1.468882 got= 1.468882 diff= 0.000000e+00 OK
+Test 3: GEMM (nr=8)
+  GEMM[nr=8] elem 0 (row 0, col 0): ref=-5.187213 got=-5.187213 diff= 0.000000e+00 OK
+  GEMM[nr=8] elem 1 (row 0, col 1): ref=-3.586448 got=-3.586448 diff= 0.000000e+00 OK
+  GEMM[nr=8] elem 2 (row 0, col 2): ref=-4.362192 got=-4.362192 diff= 0.000000e+00 OK
+  GEMM[nr=8] elem 3 (row 0, col 3): ref= 1.045701 got= 1.045701 diff= 0.000000e+00 OK
+PASS: GEMV (nr=1) + GEMM (nr=4) + GEMM (nr=8) all match single-row vec_dot within FP16 tolerance
