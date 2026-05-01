@@ -199,10 +199,10 @@ This produces:
   (per-ISA variants)
 
 The loader picks the most-capable variant the host CPU supports,
-hitting Kernel A on Zen 3 / Skylake-X, Kernel B on Alder Lake / Zen 4
-where AVX-VNNI is available without AVX-512, and the existing
-single-row AVX-512 vec_dot on Zen 4 / Sapphire Rapids / Cascade
-Lake / Skylake-X.
+hitting Kernel A on Zen 3 (haswell variant), Kernel B on Alder Lake
+(alderlake variant — AVX-VNNI without AVX-512), and the existing
+single-row AVX-512 vec_dot on Skylake-X / Cascade Lake / Zen 4 /
+Sapphire Rapids.
 
 NOTE: until the GCC 11.4 `_mm512_setr_epi8` issue is resolved (per
 the open follow-up tracked in `04-cross-arch-validation.md`), the
