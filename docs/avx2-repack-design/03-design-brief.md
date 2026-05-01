@@ -122,8 +122,8 @@ The kernel computes one matrix-vector product per call: 4 interleaved weight row
 
 - One `_mm_loadu_si128` of the 16-byte interleaved-qbits broadcast per sub-block (`k`), giving us all 4 row-masks at once.
 - One `_mm256_loadu_si256` of `qy` per sub-block, **shared** across the 4 rows.
-- One `sum(qy)` reduction per sub-block, **shared** across the 4 rows.
-- Per-row inside the sub-block: one `_mm256_blendv_epi8` (mask-driven select between zero and qy) + one horizontal-sum + one fused `2·masked − sum` + one `fmadd` into the row accumulator.
+- One `sum(qy)` partial-sum vector per sub-block (`sum_qy_v`, kept as `__m256i`), **shared** across the 4 rows.
+- Per-row inside the sub-block: one `_mm256_blendv_epi8` (mask-driven select between zero and qy) + one `maddubs+madd` to a per-lane partial-sum vector + one fused vector `2·partial − sum_qy` + one `fmadd` into the row accumulator. **No horizontal sums in the inner loop**: partial sums stay vectorised end-to-end and are only reduced once per row at write-out time.
 
 ```cpp
 // arch/x86/repack.cpp (additions)
@@ -158,11 +158,11 @@ void ggml_gemv_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
                     const __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
                     const float   d_y = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
 
-                    // sum(qy) once per sub-block (shared across 4 rows).
+                    // sum(qy) once per sub-block (shared across 4 rows). Stays a per-lane
+                    // partial-sum vector — no horizontal-sum in the inner loop.
                     const __m256i sum_qy_v = _mm256_madd_epi16(
                         _mm256_maddubs_epi16(_mm256_set1_epi8(1), qy),
                         _mm256_set1_epi16(1));
-                    const int sum_qy = hsum_epi32(sum_qy_v);
 
                     // 4 row qbits32, broadcast-loaded as a single 16-byte register.
                     const __m128i qbits_4rows = _mm_loadu_si128((const __m128i *)&xb.qs[k*16]);
@@ -179,19 +179,24 @@ void ggml_gemv_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
                         const __m256i tested    = _mm256_and_si256(shuffled, bit_mask);
                         const __m256i mask_ff   = _mm256_cmpeq_epi8(tested, bit_mask);
 
-                        // Mask-select qy into "qy where bit=1 else 0", then horizontal-sum.
+                        // Mask-select qy into "qy where bit=1 else 0", reduce to per-lane
+                        // partial-sum vector (no horizontal-sum yet).
                         const __m256i masked    = _mm256_blendv_epi8(_mm256_setzero_si256(), qy, mask_ff);
                         const __m256i partial_v = _mm256_madd_epi16(
                             _mm256_maddubs_epi16(_mm256_set1_epi8(1), masked),
                             _mm256_set1_epi16(1));
-                        const int partial = hsum_epi32(partial_v);
 
-                        // dot(±1, qy) = 2·partial − sum(qy).
-                        const float row_dot = (float)(2 * partial - sum_qy);
-                        const float d_row   = ((float *)&d0)[r];
+                        // dot(±1, qy) = 2·partial_v − sum_qy_v, kept per-lane.
+                        // Lanes carry distinct partial sums (madd_epi16 reduces 16-bit pairs);
+                        // the final hsum_float_8 at write-out time combines them correctly.
+                        const __m256i row_dot_v = _mm256_sub_epi32(
+                            _mm256_slli_epi32(partial_v, 1),
+                            sum_qy_v);
+                        const __m256  row_dot_f = _mm256_cvtepi32_ps(row_dot_v);
+                        const float   d_row     = ((float *)&d0)[r];
 
                         acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(d_row * d_y),
-                                                 _mm256_set1_ps(row_dot),
+                                                 row_dot_f,
                                                  acc[r]);
                     }
                 }
@@ -210,17 +215,20 @@ void ggml_gemv_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
 }
 ```
 
-Inner-loop op count per 32 weights, per row (after hoisting `sum_qy` and `qbits_4rows`):
+Inner-loop op count per 32 weights, per row (after hoisting `sum_qy_v`, `qy`, and `qbits_4rows` out of the per-row loop; horizontal sums removed from the hot path):
 
-| Op                          | Count |
-|-----------------------------|------:|
-| Bit expansion (5 ops)       | 5     |
-| `blendv_epi8`               | 1     |
-| `maddubs + madd + hsum`     | ~3    |
-| `fmadd` into row accumulator| 1     |
-| **Total**                   | **~10**|
+| Op                                    | Count |
+|---------------------------------------|------:|
+| Bit expansion (broadcast+shuffle+and+cmpeq, 5 ops) | 5 |
+| `blendv_epi8`                         | 1     |
+| `maddubs_epi16 + madd_epi16` (vector partial sum) | 2 |
+| `slli_epi32 + sub_epi32` (vector `2·partial − sum_qy`) | 2 |
+| `cvtepi32_ps + fmadd_ps` (accumulate into row vector) | 2 |
+| **Total**                             | **~12** |
 
-Because `qy`, `sum_qy`, and the 4-row `qbits` block are loaded **once** per sub-block but reused across 4 rows, the **amortised** count per 32-weights-per-row is `~10/4 + 0.25·(qy load + sum) ≈ 3.5–4 ops` — close to the AVX-512 path's 3 ops. **Expected speedup over the un-repacked AVX2 single-row path: ~2.5×, i.e. ~50–60 t/s prefill on the EPYC 7763 demo VM.**
+Because `qy`, `sum_qy_v`, and the 4-row `qbits` block are loaded **once** per sub-block but reused across 4 rows, the **amortised** cost per 32-weights-per-row is `~10/4 (per-row body) + 0.5·(shared loads + sum_qy) ≈ 3.5–4 ops` — close to the AVX-512 path's 3 ops. The single horizontal-sum (`hsum_float_8`) per row is paid once at the end of the column, **outside** the `nb`-deep inner loop, so it amortises to zero across the prefill.
+
+**Expected speedup over the un-repacked AVX2 single-row path: ~2.5×, i.e. ~50–60 t/s prefill on the EPYC 7763 demo VM.**
 
 ## GEMV kernel B — AVX-VNNI
 
