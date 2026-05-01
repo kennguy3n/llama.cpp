@@ -8,6 +8,9 @@ The project differentiates between 3 levels of contributors:
 
 # AI Usage Policy
 
+> [!NOTE]
+> **This is the `prism` private fork** (`kennguy3n/llama.cpp`). The upstream AI-usage rules below apply when work is being prepared for upstream submission to `ggml-org/llama.cpp`. On this private fork, AI-assisted contributions are accepted with explicit authorisation from the repository owner (@kennguy3n). AI authorship must still be disclosed in PR descriptions and commit messages.
+
 > [!IMPORTANT]
 > This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
 >
