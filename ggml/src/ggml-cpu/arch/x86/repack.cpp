@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cstdlib> // for qsort
 #include <cstdio>  // for GGML_ASSERT
+#include <vector>
 
 #define GGML_CPU_CLANG_WORKAROUND
 #include "../../repack.h"
@@ -1708,6 +1709,231 @@ void ggml_gemv_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 
     ggml_gemv_mxfp4_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+#if defined(__AVX2__)
+// ---------------------------------------------------------------------------
+// Q1_0_g128 4-row interleaved GEMV. Ported from the Phase 2 microbench
+// kernel `microbench_gemv_q1_0_g128_4x4_q8_0_avx2` (see
+// `tools/microbench/q1_g128_repack.cpp`). Phase 2 measured 1.28x speedup
+// over the existing single-row AVX2 path on Zen 3 (EPYC 7763).
+//
+// Invariants (matching the corrected design brief, post-bugfix commit
+// c1f7195 in `docs/avx2-repack-design/03-design-brief.md`):
+//   * `qy`, `sum_qy_v`, and the 4-row qbits broadcast are loaded once per
+//     sub-block (k loop) and shared across all 4 rows.
+//   * Per-row partial sums stay as `__m256i` throughout the hot path; no
+//     horizontal reduction inside the inner loop.
+//   * `dot(±1, qy) = 2 * partial - sum_qy` is computed in vector form
+//     (slli + sub).
+//   * `hsum_float_8` is paid exactly once per row at write-out, outside
+//     the `nb`-deep loop.
+// ---------------------------------------------------------------------------
+static inline float gemv_q1_0_g128_hsum_float_8(const __m256 x) {
+    __m128 res = _mm256_extractf128_ps(x, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+
+// Bit-expand a 32-bit qbits row + blendv-select into qy. Inlined per row so
+// the compiler keeps the constants (shuffle_mask / bit_mask) in registers.
+static inline __m256i gemv_q1_0_g128_select_qy_by_bits(uint32_t      qbits32,
+                                                       __m256i       qy,
+                                                       const __m256i shuffle_mask,
+                                                       const __m256i bit_mask,
+                                                       const __m256i zero) {
+    const __m128i qb128   = _mm_set1_epi32((int) qbits32);
+    const __m256i qb256   = _mm256_broadcastsi128_si256(qb128);
+    const __m256i shuf    = _mm256_shuffle_epi8(qb256, shuffle_mask);
+    const __m256i tested  = _mm256_and_si256(shuf, bit_mask);
+    const __m256i mask_ff = _mm256_cmpeq_epi8(tested, bit_mask);
+    return _mm256_blendv_epi8(zero, qy, mask_ff);
+}
+
+// Computes 4 row dot products against 1 activation column, for `nc` output
+// columns laid out in groups of 4 (one `block_q1_0_g128x4` per group).
+static void ggml_gemv_q1_0_g128_4x4_q8_0_avx2(int                        n,
+                                              float * GGML_RESTRICT      s,
+                                              size_t                     bs,
+                                              const void * GGML_RESTRICT vx,
+                                              const void * GGML_RESTRICT vy,
+                                              int                        nr,
+                                              int                        nc) {
+    const int qk                = QK8_0;
+    const int nb_q8             = n / qk;
+    const int nb                = nb_q8 / 4;
+    const int ncols_interleaved = 4;
+
+    assert(nr == 1);
+    assert(n % QK1_0_g128 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    const __m256i shuffle_mask = _mm256_set_epi8(
+        3, 3, 3, 3, 3, 3, 3, 3,
+        2, 2, 2, 2, 2, 2, 2, 2,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 0, 0, 0, 0, 0, 0, 0);
+    const __m256i bit_mask = _mm256_set_epi8(
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    const __m256i ones_b = _mm256_set1_epi8(1);
+    const __m256i ones_w = _mm256_set1_epi16(1);
+    const __m256i zero   = _mm256_setzero_si256();
+
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_q1_0_g128x4 * b_ptr = (const block_q1_0_g128x4 *) vx + (x * nb);
+
+        __m256 acc[4] = {
+            _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(), _mm256_setzero_ps(),
+        };
+
+        for (int ib = 0; ib < nb; ib++) {
+            // 4 FP16 deltas -> 4 FP32 in one F16C op.
+            const __m128 d_rows = _mm_cvtph_ps(
+                _mm_loadl_epi64((const __m128i *) &b_ptr[ib].d[0]));
+            alignas(16) float d_rows_arr[4];
+            _mm_store_ps(d_rows_arr, d_rows);
+
+            for (int k = 0; k < 4; k++) {
+                const __m256i qy = _mm256_loadu_si256(
+                    (const __m256i *) a_ptr[ib*4 + k].qs);
+                const float d_y = GGML_CPU_FP16_TO_FP32(a_ptr[ib*4 + k].d);
+
+                // Per-lane sum(qy), shared across all 4 rows.
+                const __m256i sum_qy_v = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(ones_b, qy),
+                    ones_w);
+
+                // 4 rows worth of qbits32 in one 16-byte register. Use
+                // _mm_extract_epi32 with constant immediates per row so
+                // we never round-trip through memory.
+                const __m128i qbits_4rows = _mm_loadu_si128(
+                    (const __m128i *) &b_ptr[ib].qs[k * 16]);
+                const uint32_t qbits0 = (uint32_t) _mm_extract_epi32(qbits_4rows, 0);
+                const uint32_t qbits1 = (uint32_t) _mm_extract_epi32(qbits_4rows, 1);
+                const uint32_t qbits2 = (uint32_t) _mm_extract_epi32(qbits_4rows, 2);
+                const uint32_t qbits3 = (uint32_t) _mm_extract_epi32(qbits_4rows, 3);
+
+                const __m256i masked0 = gemv_q1_0_g128_select_qy_by_bits(qbits0, qy, shuffle_mask, bit_mask, zero);
+                const __m256i masked1 = gemv_q1_0_g128_select_qy_by_bits(qbits1, qy, shuffle_mask, bit_mask, zero);
+                const __m256i masked2 = gemv_q1_0_g128_select_qy_by_bits(qbits2, qy, shuffle_mask, bit_mask, zero);
+                const __m256i masked3 = gemv_q1_0_g128_select_qy_by_bits(qbits3, qy, shuffle_mask, bit_mask, zero);
+
+                const __m256i partial0 = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(ones_b, masked0), ones_w);
+                const __m256i partial1 = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(ones_b, masked1), ones_w);
+                const __m256i partial2 = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(ones_b, masked2), ones_w);
+                const __m256i partial3 = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(ones_b, masked3), ones_w);
+
+                const __m256i row_dot0 = _mm256_sub_epi32(_mm256_slli_epi32(partial0, 1), sum_qy_v);
+                const __m256i row_dot1 = _mm256_sub_epi32(_mm256_slli_epi32(partial1, 1), sum_qy_v);
+                const __m256i row_dot2 = _mm256_sub_epi32(_mm256_slli_epi32(partial2, 1), sum_qy_v);
+                const __m256i row_dot3 = _mm256_sub_epi32(_mm256_slli_epi32(partial3, 1), sum_qy_v);
+
+                acc[0] = _mm256_fmadd_ps(_mm256_set1_ps(d_rows_arr[0] * d_y),
+                                         _mm256_cvtepi32_ps(row_dot0), acc[0]);
+                acc[1] = _mm256_fmadd_ps(_mm256_set1_ps(d_rows_arr[1] * d_y),
+                                         _mm256_cvtepi32_ps(row_dot1), acc[1]);
+                acc[2] = _mm256_fmadd_ps(_mm256_set1_ps(d_rows_arr[2] * d_y),
+                                         _mm256_cvtepi32_ps(row_dot2), acc[2]);
+                acc[3] = _mm256_fmadd_ps(_mm256_set1_ps(d_rows_arr[3] * d_y),
+                                         _mm256_cvtepi32_ps(row_dot3), acc[3]);
+            }
+        }
+
+        for (int r = 0; r < 4; r++) {
+            s[x * ncols_interleaved + r] = gemv_q1_0_g128_hsum_float_8(acc[r]);
+        }
+    }
+}
+#endif // __AVX2__
+
+void ggml_gemv_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX2__)
+    ggml_gemv_q1_0_g128_4x4_q8_0_avx2(n, s, bs, vx, vy, nr, nc);
+    return;
+#endif
+
+    ggml_gemv_q1_0_g128_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+// Unpack one row out of a `block_q8_0x4` stream into a contiguous
+// `block_q8_0` stream. Mirrors the encoder in
+// `ggml_quantize_mat_q8_0_4x4_generic` (`repack.cpp:51`):
+//
+//   blck_size_interleave = 4
+//   src_offset = (j / 16) * 4 + (j % 4)
+//   src_id     = (j % 16) / 4              // == row index r
+//   encoded_idx = (j / 4) * 16 + r * 4 + (j % 4)
+//
+// `src` points to `nb_q8` `block_q8_0x4` instances; `dst` is filled with
+// `nb_q8` `block_q8_0` instances for row `r` (0..3).
+static inline void gemm_q1_0_g128_unpack_row_from_q8_0x4(int                  r,
+                                                         int                  nb_q8,
+                                                         const block_q8_0x4 * src,
+                                                         block_q8_0 *         dst) {
+    for (int ib = 0; ib < nb_q8; ib++) {
+        dst[ib].d = src[ib].d[r];
+        for (int j = 0; j < QK8_0; j++) {
+            const int encoded_idx = (j / 4) * 16 + r * 4 + (j % 4);
+            dst[ib].qs[j] = src[ib].qs[encoded_idx];
+        }
+    }
+}
+
+void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    // The repack tensor_traits<..., INTER_SIZE=4, ..., GGML_TYPE_Q8_0>
+    // dispatcher quantises src1 with `ggml_quantize_mat_q8_0_4x4`, which
+    // produces a 4-row interleaved `block_q8_0x4` buffer (see
+    // `repack.cpp:51`). My single-row GEMV consumes plain `block_q8_0`,
+    // so the GEMM unpacks 4 activation rows at a time before delegating
+    // to the GEMV kernel.
+    //
+    // `bs` is the FP32 output row stride in **float elements** (it's
+    // `nb1 / nb0` from `forward_mul_mat_one_chunk`, with `nb0 =
+    // sizeof(float)`), matching the convention used by every other GEMM
+    // in this file (e.g. `s + ((y * 4 + i) * bs + x * 8)` at line 1270).
+    const int qk    = QK8_0;
+    const int nb_q8 = n / qk;
+
+    assert(nr % 4 == 0);
+    assert(nc % 4 == 0);
+    assert(n % QK1_0_g128 == 0);
+
+    std::vector<block_q8_0>    unpacked((size_t) nb_q8);
+    const block_q8_0x4 * a_pack_base = (const block_q8_0x4 *) vy;
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_pack = a_pack_base + (size_t) y * nb_q8;
+        for (int r = 0; r < 4; r++) {
+            gemm_q1_0_g128_unpack_row_from_q8_0x4(r, nb_q8, a_pack, unpacked.data());
+
+#if defined(__AVX2__)
+            ggml_gemv_q1_0_g128_4x4_q8_0_avx2(n,
+                                              s + (size_t)(y * 4 + r) * bs, bs,
+                                              vx, unpacked.data(),
+                                              /* nr = */ 1, nc);
+#else
+            ggml_gemv_q1_0_g128_4x4_q8_0_generic(n,
+                                                 s + (size_t)(y * 4 + r) * bs, bs,
+                                                 vx, unpacked.data(),
+                                                 /* nr = */ 1, nc);
+#endif
+        }
+    }
 }
 
 void ggml_gemv_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
