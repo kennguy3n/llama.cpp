@@ -1,0 +1,17 @@
+microbench-q1-g128-repack: Phase 2 harness for the proposed AVX2/AVX-VNNI
+  runtime repack of Q1_0_g128. See docs/avx2-repack-design/03-design-brief.md
+  Configuration: nb=13312 (n=1703936 weights), iters=256, seed=0xc0ffee
+
+Build features: AVX2 FMA F16C
+
+Parity check (4 rows, scalar baseline):
+  row 0  scalar=   -716.229919  avx2_single=   -716.230042  gemv_avx2=   -716.230042  OK
+  row 1  scalar=    777.583862  avx2_single=    777.581665  gemv_avx2=    777.581665  OK
+  row 2  scalar=   1437.211182  avx2_single=   1437.217041  gemv_avx2=   1437.217041  OK
+  row 3  scalar=     51.592018  avx2_single=     51.593933  gemv_avx2=     51.593933  OK
+Parity: OK
+
+  Timing (13312 weight blocks = 1703936 weights, 256 iters, median ns):
+    scalar                    34476683 ns / 4 rows  (8619170.8 ns/row)
+    vec_dot_avx2                451293 ns / 4 rows  (112823.2 ns/row)
+    gemv_4x4_avx2 (NEW)         351807 ns / 4 rows  (87951.8 ns/row)
