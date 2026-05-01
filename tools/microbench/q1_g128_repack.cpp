@@ -750,6 +750,17 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (nb <= 0) {
+        std::fprintf(stderr,
+                     "error: --blocks must be > 0 (got %d)\n", nb);
+        return 1;
+    }
+    if (iters <= 0) {
+        std::fprintf(stderr,
+                     "error: --iters must be > 0 (got %d)\n", iters);
+        return 1;
+    }
+
     std::printf(
         "microbench-q1-g128-repack: Phase 2 harness for the proposed AVX2/AVX-VNNI\n"
         "  runtime repack of Q1_0_g128. See docs/avx2-repack-design/03-design-brief.md\n"
