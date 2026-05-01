@@ -4,9 +4,8 @@ Companion to baseline-zen3-epyc-7763.txt (Phase 2 microbench harness).
 Host:
   AMD EPYC 7763 (Zen 3, AVX2 only, no AVX-512), 4 vCPU, 8 GiB RAM
   Linux 6.x, GCC, -DCMAKE_BUILD_TYPE=Release, -DGGML_CPU_REPACK=ON
-  llama.cpp commit 8d6c3379 (prism branch + Phase 3 fix for GEMM stride /
-  q8_0x4 unpack; supersedes the original 27.03 t/s number which was on
-  silently corrupted output - see History section at the bottom).
+  llama.cpp prism HEAD = 68bef1f5 (PR #12 merged) + this PR's true
+  4x4 GEMM kernel (`ggml_gemm_q1_0_g128_4x4_q8_0_avx2_4rows`).
 
 Model:
   Bonsai-1.7B Q1_0_g128, 248302272 B (231.13 MiB)
@@ -14,25 +13,55 @@ Model:
   No GGUF format change; runtime repack happens at tensor allocation time.
 
 Methodology:
-  llama-bench, default warmup, -r 5 (medians shown as t/s ± stdev)
-  A/B: same binary, same model, same flags. Baseline run from a `git stash`
-  of the Phase 3 changes; repack run from the working tree with all changes
-  applied. Both runs done back-to-back on a quiet VM.
+  llama-bench, default warmup, -r 5 (medians shown as t/s ± stdev).
+  Three back-to-back runs of llama-bench on a quiet VM; the median row
+  is shown as the headline number. Variance run-to-run is ~+/- 1 t/s,
+  consistent with shared-VM thermal/scheduling noise.
 
 Results (-t 4):
 
-  Variant                         | pp512 (t/s)    | tg64 (t/s)
-  --------------------------------|---------------:|-----------:
-  Existing single-row AVX2 path   | 22.62 ± 0.04   | n/a (not run)
-  Phase 3 4x4 GEMV+GEMM (fixed)   | 25.29 ± 0.17   | 20.56 ± 0.14
+  Variant                              | pp512 (t/s)    | tg64 (t/s)
+  -------------------------------------|---------------:|-----------:
+  Existing single-row AVX2 path        | 22.62 +/- 0.04 | n/a
+  PR #12 4-call-GEMV + on-the-fly unpack| 25.29 +/- 0.17| 20.56 +/- 0.14
+  This PR: true 4x4 GEMM (run 1)       | 30.87 +/- 0.15 | 20.53 +/- 0.08
+  This PR: true 4x4 GEMM (run 2)       | 31.20 +/- 0.09 | 20.44 +/- 0.10
+  This PR: true 4x4 GEMM (run 3)       | 29.14 +/- 0.17 | 20.08 +/- 0.12
 
-  Speedup: 25.29 / 22.62 = 1.118x prefill on validated, bit-identical
-  output. The gap from the Phase 2 microbench projection (1.28x) and from
-  the original buggy measurement (1.195x) is consistent with the new GEMM
-  unpack-from-block_q8_0x4 step that was required to keep the output
-  correct (see History below); the prefill graph also doesn't fully
-  bottleneck on the q1_0_g128 matmul - attention, RMS norms, ROPE, and
-  embedding lookups don't benefit from the kernel change.
+  Median: pp512 = 30.87 t/s, tg64 = 20.44 t/s
+  Speedup vs single-row baseline: 30.87 / 22.62 = 1.365x prefill
+  Speedup vs PR #12 (post-fix):   30.87 / 25.29 = 1.221x prefill
+  tg64 (token gen) is unchanged, as expected: token generation uses the
+  GEMV path (nr=1), not the GEMM path that this PR replaces.
+
+  As a sanity check, the original *buggy* PR #12 measurement (27.03 t/s
+  on silently corrupted output) is still 14% below the validated 30.87
+  number this PR achieves on bit-identical output -- so the 7% gap from
+  the unpack-fix is fully recovered, plus another 7%.
+
+Why this is faster than the 4-call GEMV:
+
+  The PR #12 GEMM did 4 sequential calls into the single-row 4x4 GEMV,
+  one per activation row. That meant:
+    - Each block_q1_0_g128x4 weight was loaded (and its 32-bit qbits
+      stripe expanded to a 32-byte +-1 mask) 4x per y-group.
+    - The acc[4] FP32 accumulator was re-zeroed and re-flushed 4x per
+      y-group (instead of once across all 16 (r_a, r_w) pairs).
+
+  The new kernel
+  (`ggml_gemm_q1_0_g128_4x4_q8_0_avx2_4rows` in arch/x86/repack.cpp):
+    - Loads each weight block once per y-group; expands each row's
+      qbits to a __m256i mask once per sub-block, then re-uses across
+      all 4 activation rows (16 blendv per sub-block instead of 16
+      mask-expansions per sub-block).
+    - Holds 16 __m256 accumulators in registers across the inner loop,
+      with sub-block FP32 scaling applied at sub-block close (fmadd).
+      Some spilling is expected with 16 ymm + scratch -- the spilled
+      accumulators stay hot in L1.
+    - Keeps the "unpack 4 rows from block_q8_0x4" step but does it
+      ONCE per y-group into a 4-buffer scratch (not 4x per y-group as
+      PR #12 did). The unpack itself is a small fraction of total
+      time (estimated <0.5%).
 
 Parity:
 
@@ -44,53 +73,31 @@ Parity:
 
   llama-cli smoke test:
     Prompt: "The capital of France is"
-    Output: "The capital of France is **Paris**. It is also..."
-    (vs the buggy version which produced `?` characters; see History.)
+    Output: "The capital of France is **Paris**."
+    (Tokens are real text -- no `?` corruption from the pre-fix bug.)
 
 History:
 
-  The first Phase 3 commit measured 27.03 t/s prefill, but Devin Review
-  caught two correctness bugs in the GEMM wrappers in arch/x86/repack.cpp
-  and repack.cpp:
-    1. The GEMM divided `bs` (already in float-element units, since
-       nb0 == sizeof(float) for FP32 outputs) by sizeof(float) a second
-       time, so each row's output was written 4x closer than it should
-       have been and rows 1..3 silently overwrote row 0.
-    2. The GEMM also misread its src1 input - the dispatcher
-       (forward_mul_mat_one_chunk + ggml_quantize_mat_q8_0_4x4) packs
-       activations as block_q8_0x4 (4 rows interleaved, 4-byte
-       granularity), but the GEMM was treating that buffer as a flat
-       array of block_q8_0.
+  PR #12 first measured 27.03 t/s on silently corrupted output (the
+  GEMM divided `bs` by sizeof(float) a second time, AND mis-read
+  block_q8_0x4 as flat block_q8_0). The bs+layout fix added an
+  on-the-fly unpack-from-q8_0x4 + 4 sequential GEMV calls per
+  y-group, dropping prefill to 25.29 t/s on validated output.
 
-  Both bugs were silent: llama-bench reported 27.03 t/s of garbage
-  tokens (the throughput counter doesn't validate output), but llama-cli
-  produced `?` characters instead of real text. The parity test missed
-  it because it only exercised the GEMV path (nr=1).
-
-  The fix (this version):
-    - Remove the spurious `bs / sizeof(float)` divide in both GEMMs.
-    - Unpack 4 rows out of each block_q8_0x4 group on the fly into a
-      contiguous block_q8_0 scratch buffer, then call the existing
-      single-row-into-4 GEMV. (Loses some perf vs a real 4x4 GEMM, but
-      the output is now bit-identical to the single-row vec_dot.)
-    - Extend tests/test-q1-g128-repack-parity.cpp to also exercise
-      the GEMM path with nr=4 and nr=8; both pass with diff=0.
-    - Validate the fix with llama-cli `"The capital of France is"`
-      generating real text.
-
-  Final perf: 1.118x prefill on correct output, vs 1.195x on the
-  corrupted output. Honest tradeoff: correctness costs ~7% of the
-  measured win until a true 4x4 GEMM kernel is written that consumes
-  block_q8_0x4 directly without the unpack.
+  This PR replaces the 4-call GEMV with a single true-4x4 GEMM that
+  shares qbits load + expansion across the 4 activation rows. The
+  unpack step is preserved (it's negligible) but is now done once
+  per y-group instead of 4x. Net: 30.87 t/s on validated output --
+  past the original buggy 27.03 number, on bit-identical output.
 
 Dispatcher gate:
 
   Q1_0_g128 only opts into the runtime repack on hosts where AVX2 is
   available AND AVX-512 is not. AVX-512 hosts retain the existing
-  single-row path in arch/x86/quants.c (which uses VNNI-style mask blends
-  via mmask32 + dpbusd and is faster than the 4x4 repack). NEON / RISC-V /
-  Metal / CUDA / Vulkan paths are untouched - they continue to use the
-  single-row vec_dot from quants.c.
+  single-row path in arch/x86/quants.c (which uses VNNI-style mask
+  blends via mmask32 + dpbusd and is faster than the 4x4 repack).
+  NEON / RISC-V / Metal / CUDA / Vulkan paths are untouched -- they
+  continue to use the single-row vec_dot from quants.c.
 
 Next steps:
 
@@ -98,5 +105,8 @@ Next steps:
     until a target host is available for measurement (qemu/SDE will not
     give meaningful timings).
   - Optional: 8-row interleave on AVX-512 hosts where the existing
-    single-row path is already optimal - low priority, possibly not worth
-    the GGUF complexity.
+    single-row path is already optimal - low priority, possibly not
+    worth the GGUF complexity.
+  - Optional: eliminate the unpack entirely by writing a chunk-based
+    inner loop that consumes block_q8_0x4 directly. Estimated <1% win
+    given the unpack is already <0.5% of total time -- not pursued.

@@ -1894,13 +1894,151 @@ static inline void gemm_q1_0_g128_unpack_row_from_q8_0x4(int                  r,
     }
 }
 
+#if defined(__AVX2__)
+// True 4x4 GEMM kernel: processes 4 activation rows in parallel against
+// the 4-row-interleaved `block_q1_0_g128x4` weights. Activations have
+// already been unpacked into 4 contiguous `block_q8_0` streams.
+//
+// vs. the 4-call GEMV approach (PR #12 baseline), this kernel:
+//   * Loads each `block_q1_0_g128x4` ONCE per y group (was 4x), and in
+//     particular expands each weight row's 32-bit qbits into a 32-byte
+//     +-1 mask once per sub-block (was 4x).
+//   * Holds 16 `__m256i` per-(r_a, r_w) integer partial accumulators in
+//     registers across the inner loop, with per-q8 sub-block FP32
+//     scaling applied via FMA at the sub-block boundary -- NOT inside
+//     the bit-expansion path.
+//   * Walks the `nb_q1` weight blocks once, sharing the 4-row qbits
+//     across the 4 activation rows -> ~4x reduction in weight bandwidth
+//     out of L2.
+//
+// Output is bit-identical to 4 sequential calls of
+// `ggml_gemv_q1_0_g128_4x4_q8_0_avx2` against the same unpacked rows
+// (verified by `tests/test-q1-g128-repack-parity.cpp` with nr=4 and
+// nr=8).
+static void ggml_gemm_q1_0_g128_4x4_q8_0_avx2_4rows(
+        int                            n,
+        float * GGML_RESTRICT          s,
+        size_t                         bs,
+        const block_q1_0_g128x4 * GGML_RESTRICT b_base,
+        const block_q8_0 * GGML_RESTRICT a_rows[4],
+        int                            nc) {
+    const int qk                = QK8_0;
+    const int nb_q8             = n / qk;
+    const int nb                = nb_q8 / 4;
+    const int ncols_interleaved = 4;
+
+    assert(n % QK1_0_g128 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    const __m256i shuffle_mask = _mm256_set_epi8(
+        3, 3, 3, 3, 3, 3, 3, 3,
+        2, 2, 2, 2, 2, 2, 2, 2,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 0, 0, 0, 0, 0, 0, 0);
+    const __m256i bit_mask = _mm256_set_epi8(
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char) 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    const __m256i ones_b = _mm256_set1_epi8(1);
+    const __m256i ones_w = _mm256_set1_epi16(1);
+    const __m256i zero   = _mm256_setzero_si256();
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_q1_0_g128x4 * b_ptr = b_base + (size_t) x * nb;
+
+        // 16 FP32 accumulators -- one per (r_a, r_w) pair. Register
+        // pressure is high: 16 ymm. The compiler will schedule but may
+        // spill some -- the spilled accumulators stay hot in L1 across
+        // the inner loop, so the cost is small.
+        __m256 acc[4][4];
+        for (int r_a = 0; r_a < 4; r_a++) {
+            for (int r_w = 0; r_w < 4; r_w++) {
+                acc[r_a][r_w] = _mm256_setzero_ps();
+            }
+        }
+
+        for (int ib = 0; ib < nb; ib++) {
+            // 4 weight deltas (one per weight row r_w) -> FP32.
+            const __m128 d_w = _mm_cvtph_ps(
+                _mm_loadl_epi64((const __m128i *) &b_ptr[ib].d[0]));
+            alignas(16) float d_w_arr[4];
+            _mm_store_ps(d_w_arr, d_w);
+
+            for (int sb = 0; sb < 4; sb++) {
+                // Load the 4-row qbits stripe ONCE, extract 32 bits per
+                // weight row.
+                const __m128i qbits_4rows = _mm_loadu_si128(
+                    (const __m128i *) &b_ptr[ib].qs[sb * 16]);
+                const uint32_t qbits_w[4] = {
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 0),
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 1),
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 2),
+                    (uint32_t) _mm_extract_epi32(qbits_4rows, 3),
+                };
+
+                // Expand each weight row's 32 bits into a 32-byte
+                // 0xFF/0x00 mask ONCE per sub-block. Shared across the 4
+                // activation rows below.
+                __m256i mask_w[4];
+                for (int r_w = 0; r_w < 4; r_w++) {
+                    const __m128i qb128  = _mm_set1_epi32((int) qbits_w[r_w]);
+                    const __m256i qb256  = _mm256_broadcastsi128_si256(qb128);
+                    const __m256i shuf   = _mm256_shuffle_epi8(qb256, shuffle_mask);
+                    const __m256i tested = _mm256_and_si256(shuf, bit_mask);
+                    mask_w[r_w]          = _mm256_cmpeq_epi8(tested, bit_mask);
+                }
+
+                // For each activation row, load qy + sum_qy_v, then
+                // dot-product against all 4 expanded weight masks.
+                for (int r_a = 0; r_a < 4; r_a++) {
+                    const __m256i qy = _mm256_loadu_si256(
+                        (const __m256i *) a_rows[r_a][ib * 4 + sb].qs);
+                    const float d_y =
+                        GGML_CPU_FP16_TO_FP32(a_rows[r_a][ib * 4 + sb].d);
+
+                    // sum_qy_v: per-lane __m256i, shared across all 4 weight rows.
+                    const __m256i sum_qy_v = _mm256_madd_epi16(
+                        _mm256_maddubs_epi16(ones_b, qy), ones_w);
+
+                    for (int r_w = 0; r_w < 4; r_w++) {
+                        // masked = qy where mask=0xFF, else 0.
+                        const __m256i masked = _mm256_blendv_epi8(zero, qy, mask_w[r_w]);
+                        // partial = sum(masked) per lane = sum(qy where bit=1).
+                        const __m256i partial = _mm256_madd_epi16(
+                            _mm256_maddubs_epi16(ones_b, masked), ones_w);
+                        // row_dot = 2*partial - sum_qy = sum(+-qy) = bipolar dot.
+                        const __m256i row_dot = _mm256_sub_epi32(
+                            _mm256_slli_epi32(partial, 1), sum_qy_v);
+
+                        acc[r_a][r_w] = _mm256_fmadd_ps(
+                            _mm256_set1_ps(d_w_arr[r_w] * d_y),
+                            _mm256_cvtepi32_ps(row_dot),
+                            acc[r_a][r_w]);
+                    }
+                }
+            }
+        }
+
+        for (int r_a = 0; r_a < 4; r_a++) {
+            for (int r_w = 0; r_w < 4; r_w++) {
+                s[r_a * bs + x * ncols_interleaved + r_w] =
+                    gemv_q1_0_g128_hsum_float_8(acc[r_a][r_w]);
+            }
+        }
+    }
+}
+#endif // __AVX2__
+
 void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     // The repack tensor_traits<..., INTER_SIZE=4, ..., GGML_TYPE_Q8_0>
     // dispatcher quantises src1 with `ggml_quantize_mat_q8_0_4x4`, which
     // produces a 4-row interleaved `block_q8_0x4` buffer (see
-    // `repack.cpp:51`). My single-row GEMV consumes plain `block_q8_0`,
-    // so the GEMM unpacks 4 activation rows at a time before delegating
-    // to the GEMV kernel.
+    // `repack.cpp:51`). My GEMV consumes plain `block_q8_0`, so the GEMM
+    // unpacks 4 activation rows ONCE per y group into a contiguous
+    // scratch buffer, then runs a 4x4 inner kernel that walks the
+    // `block_q1_0_g128x4` weights once and shares the per-sub-block bit
+    // expansion across all 4 activation rows.
     //
     // `bs` is the FP32 output row stride in **float elements** (it's
     // `nb1 / nb0` from `forward_mul_mat_one_chunk`, with `nb0 =
@@ -1913,26 +2051,42 @@ void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, con
     assert(nc % 4 == 0);
     assert(n % QK1_0_g128 == 0);
 
-    std::vector<block_q8_0>    unpacked((size_t) nb_q8);
+    // 4 row buffers, allocated once per call (not per y group). Each row
+    // holds `nb_q8` block_q8_0 instances = 36 B/block * nb_q8.
+    std::vector<block_q8_0> unpacked((size_t) nb_q8 * 4);
     const block_q8_0x4 * a_pack_base = (const block_q8_0x4 *) vy;
 
     for (int y = 0; y < nr / 4; y++) {
         const block_q8_0x4 * a_pack = a_pack_base + (size_t) y * nb_q8;
+
+        block_q8_0 * row_bufs[4] = {
+            unpacked.data() + (size_t) 0 * nb_q8,
+            unpacked.data() + (size_t) 1 * nb_q8,
+            unpacked.data() + (size_t) 2 * nb_q8,
+            unpacked.data() + (size_t) 3 * nb_q8,
+        };
         for (int r = 0; r < 4; r++) {
-            gemm_q1_0_g128_unpack_row_from_q8_0x4(r, nb_q8, a_pack, unpacked.data());
+            gemm_q1_0_g128_unpack_row_from_q8_0x4(r, nb_q8, a_pack, row_bufs[r]);
+        }
 
 #if defined(__AVX2__)
-            ggml_gemv_q1_0_g128_4x4_q8_0_avx2(n,
-                                              s + (size_t)(y * 4 + r) * bs, bs,
-                                              vx, unpacked.data(),
-                                              /* nr = */ 1, nc);
+        const block_q1_0_g128x4 * b_base = (const block_q1_0_g128x4 *) vx;
+        const block_q8_0 * a_rows_const[4] = {
+            row_bufs[0], row_bufs[1], row_bufs[2], row_bufs[3]
+        };
+        ggml_gemm_q1_0_g128_4x4_q8_0_avx2_4rows(
+            n,
+            s + (size_t) (y * 4) * bs, bs,
+            b_base, a_rows_const, nc);
 #else
+        // Generic fallback: 4 sequential GEMV calls.
+        for (int r = 0; r < 4; r++) {
             ggml_gemv_q1_0_g128_4x4_q8_0_generic(n,
                                                  s + (size_t)(y * 4 + r) * bs, bs,
-                                                 vx, unpacked.data(),
+                                                 vx, row_bufs[r],
                                                  /* nr = */ 1, nc);
-#endif
         }
+#endif
     }
 }
 
