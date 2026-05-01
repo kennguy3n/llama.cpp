@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <vector>
 
 #include "repack.h"
 
@@ -2066,22 +2067,44 @@ void ggml_gemm_q1_0_g128_4x4_q8_0_generic(int                        n,
                                           const void * GGML_RESTRICT vy,
                                           int                        nr,
                                           int                        nc) {
-    // Generic GEMM = looped GEMV over `nr` activation rows. The per-call
-    // 1.28x win still applies on every row; what we DON'T get here is the
-    // amortisation of weight loads across 4 src1 columns (which would
-    // require a true 4x4 GEMM kernel and isn't measured by Phase 2).
+    // Generic-fallback GEMM. The repack tensor_traits<..., INTER_SIZE=4,
+    // ..., GGML_TYPE_Q8_0> dispatcher quantises src1 with
+    // `ggml_quantize_mat_q8_0_4x4` (above in this TU), which produces a
+    // 4-row interleaved `block_q8_0x4` buffer. The single-row GEMV in
+    // this file consumes plain `block_q8_0`, so we unpack 4 rows at a
+    // time before delegating.
+    //
+    // `bs` is the FP32 output row stride in **float elements** (it's
+    // `nb1 / nb0` from `forward_mul_mat_one_chunk`, with `nb0 =
+    // sizeof(float)`), matching the convention used by every other GEMM
+    // in `arch/x86/repack.cpp` (e.g. `s + ((y * 4 + i) * bs + x * 8)`).
     const int qk    = QK8_0;
     const int nb_q8 = n / qk;
-    const size_t src1_col_stride = (size_t) nb_q8 * sizeof(block_q8_0);
-    const size_t bs_floats = bs / sizeof(float);
 
-    assert(n % QK1_0_g128 == 0);
+    assert(nr % 4 == 0);
     assert(nc % 4 == 0);
+    assert(n % QK1_0_g128 == 0);
 
-    for (int row = 0; row < nr; row++) {
-        const void * vy_col = (const char *) vy + (size_t) row * src1_col_stride;
-        ggml_gemv_q1_0_g128_4x4_q8_0(n, s + (size_t) row * bs_floats, bs, vx,
-                                     vy_col, /* nr = */ 1, nc);
+    std::vector<block_q8_0> unpacked((size_t) nb_q8);
+    const block_q8_0x4 * a_pack_base = (const block_q8_0x4 *) vy;
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_pack = a_pack_base + (size_t) y * nb_q8;
+        for (int r = 0; r < 4; r++) {
+            // mirror of `ggml_quantize_mat_q8_0_4x4_generic` encoder
+            // (above in this TU): blck_size_interleave = 4.
+            for (int ib = 0; ib < nb_q8; ib++) {
+                unpacked[ib].d = a_pack[ib].d[r];
+                for (int j = 0; j < QK8_0; j++) {
+                    const int encoded_idx = (j / 4) * 16 + r * 4 + (j % 4);
+                    unpacked[ib].qs[j] = a_pack[ib].qs[encoded_idx];
+                }
+            }
+            ggml_gemv_q1_0_g128_4x4_q8_0(n,
+                                         s + (size_t)(y * 4 + r) * bs, bs,
+                                         vx, unpacked.data(),
+                                         /* nr = */ 1, nc);
+        }
     }
 }
 

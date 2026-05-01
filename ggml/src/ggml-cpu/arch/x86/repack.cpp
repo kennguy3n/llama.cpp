@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cstdlib> // for qsort
 #include <cstdio>  // for GGML_ASSERT
+#include <vector>
 
 #define GGML_CPU_CLANG_WORKAROUND
 #include "../../repack.h"
@@ -1869,25 +1870,70 @@ void ggml_gemv_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, con
     ggml_gemv_q1_0_g128_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
-void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-#if defined(__AVX2__)
-    // No specialised GEMM kernel yet; loop the AVX2 GEMV across `nr` activation
-    // rows. The per-row weight loads are still amortised across 4 src0 columns
-    // by the GEMV layout, so prefill workloads (where nrows >= 4) still get the
-    // 1.28x win measured in Phase 2.
-    const int    qk      = QK8_0;
-    const int    nb_q8   = n / qk;
-    const size_t src1_col_stride = (size_t) nb_q8 * sizeof(block_q8_0);
-    const size_t bs_floats = bs / sizeof(float);
-    for (int row = 0; row < nr; row++) {
-        const void * vy_col = (const char *) vy + (size_t) row * src1_col_stride;
-        ggml_gemv_q1_0_g128_4x4_q8_0_avx2(n, s + (size_t) row * bs_floats, bs, vx,
-                                          vy_col, /* nr = */ 1, nc);
+// Unpack one row out of a `block_q8_0x4` stream into a contiguous
+// `block_q8_0` stream. Mirrors the encoder in
+// `ggml_quantize_mat_q8_0_4x4_generic` (`repack.cpp:51`):
+//
+//   blck_size_interleave = 4
+//   src_offset = (j / 16) * 4 + (j % 4)
+//   src_id     = (j % 16) / 4              // == row index r
+//   encoded_idx = (j / 4) * 16 + r * 4 + (j % 4)
+//
+// `src` points to `nb_q8` `block_q8_0x4` instances; `dst` is filled with
+// `nb_q8` `block_q8_0` instances for row `r` (0..3).
+static inline void gemm_q1_0_g128_unpack_row_from_q8_0x4(int                  r,
+                                                         int                  nb_q8,
+                                                         const block_q8_0x4 * src,
+                                                         block_q8_0 *         dst) {
+    for (int ib = 0; ib < nb_q8; ib++) {
+        dst[ib].d = src[ib].d[r];
+        for (int j = 0; j < QK8_0; j++) {
+            const int encoded_idx = (j / 4) * 16 + r * 4 + (j % 4);
+            dst[ib].qs[j] = src[ib].qs[encoded_idx];
+        }
     }
-    return;
-#endif
+}
 
-    ggml_gemm_q1_0_g128_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    // The repack tensor_traits<..., INTER_SIZE=4, ..., GGML_TYPE_Q8_0>
+    // dispatcher quantises src1 with `ggml_quantize_mat_q8_0_4x4`, which
+    // produces a 4-row interleaved `block_q8_0x4` buffer (see
+    // `repack.cpp:51`). My single-row GEMV consumes plain `block_q8_0`,
+    // so the GEMM unpacks 4 activation rows at a time before delegating
+    // to the GEMV kernel.
+    //
+    // `bs` is the FP32 output row stride in **float elements** (it's
+    // `nb1 / nb0` from `forward_mul_mat_one_chunk`, with `nb0 =
+    // sizeof(float)`), matching the convention used by every other GEMM
+    // in this file (e.g. `s + ((y * 4 + i) * bs + x * 8)` at line 1270).
+    const int qk    = QK8_0;
+    const int nb_q8 = n / qk;
+
+    assert(nr % 4 == 0);
+    assert(nc % 4 == 0);
+    assert(n % QK1_0_g128 == 0);
+
+    std::vector<block_q8_0>    unpacked((size_t) nb_q8);
+    const block_q8_0x4 * a_pack_base = (const block_q8_0x4 *) vy;
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_pack = a_pack_base + (size_t) y * nb_q8;
+        for (int r = 0; r < 4; r++) {
+            gemm_q1_0_g128_unpack_row_from_q8_0x4(r, nb_q8, a_pack, unpacked.data());
+
+#if defined(__AVX2__)
+            ggml_gemv_q1_0_g128_4x4_q8_0_avx2(n,
+                                              s + (size_t)(y * 4 + r) * bs, bs,
+                                              vx, unpacked.data(),
+                                              /* nr = */ 1, nc);
+#else
+            ggml_gemv_q1_0_g128_4x4_q8_0_generic(n,
+                                                 s + (size_t)(y * 4 + r) * bs, bs,
+                                                 vx, unpacked.data(),
+                                                 /* nr = */ 1, nc);
+#endif
+        }
+    }
 }
 
 void ggml_gemv_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
