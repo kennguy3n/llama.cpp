@@ -1,0 +1,67 @@
+=== SDE -icx (Ice Lake = AVX-512F+BW+VL+VNNI) parity + timing ===
+Recorded by Devin on 2026-05-01T22:51:06Z under Intel SDE 9.48.0 -icx.
+Host: AMD EPYC 7763 (Zen 3, AVX2-only). All AVX-512 paths execute under
+SDE software emulation; the 'ns/row' timings are NOT real hardware timings
+and should be ignored. Only the parity column ('OK' on every row) and the
+absolute FP32 values matter; structural-perf numbers are recorded separately
+via SDE -mix in 08-avx512-vnni-kernel-c.md.
+
+microbench-q1-g128-repack: Phase 2 harness for the proposed AVX2/AVX-VNNI
+  runtime repack of Q1_0_g128. See docs/avx2-repack-design/03-design-brief.md
+  Configuration: nb=64 (n=8192 weights), iters=8, seed=0xc0ffee
+
+Build features: AVX512F AVX512BW AVX512VL AVX512VNNI AVX2 FMA F16C
+
+Parity check (4 rows, scalar baseline):
+  row 0  scalar=    -40.244610  avx2_single=    -40.244576  gemv_avx2=    -40.244576  avx512_single=    -40.244576  gemv_avx512=    -40.244576  OK
+  row 1  scalar=    -68.837616  avx2_single=    -68.837593  gemv_avx2=    -68.837593  avx512_single=    -68.837593  gemv_avx512=    -68.837593  OK
+  row 2  scalar=     64.643204  avx2_single=     64.643234  gemv_avx2=     64.643234  avx512_single=     64.643234  gemv_avx512=     64.643234  OK
+  row 3  scalar=     -0.807468  avx2_single=     -0.807454  gemv_avx2=     -0.807454  avx512_single=     -0.807454  gemv_avx512=     -0.807454  OK
+Parity: OK
+
+  Timing (64 weight blocks = 8192 weights, 8 iters, median ns):
+    scalar                      158887 ns / 4 rows  (39721.8 ns/row)
+    vec_dot_avx2                 48250 ns / 4 rows  (12062.5 ns/row)
+    gemv_4x4_avx2 (NEW)         153647 ns / 4 rows  (38411.8 ns/row)
+    vec_dot_avx512_vnni         489904 ns / 4 rows  (122476.0 ns/row)
+    gemv_4x4_avx512_vnni (NEW)      194874 ns / 4 rows  (48718.5 ns/row)
+
+=== SDE -clx (Cascade Lake = AVX-512F+BW+VL+VNNI, NO AVX-VNNI) parity ===
+Cascade Lake is the canonical host class for Kernel C: it has the AVX-512
+VNNI features Kernel C needs but lacks the VEX-encoded AVX-VNNI variant of
+Kernel B. Today these hosts use single-row AVX-512 vec_dot for Q1_0_g128;
+Kernel C is the proposed alternative.
+
+microbench-q1-g128-repack: Phase 2 harness for the proposed AVX2/AVX-VNNI
+  runtime repack of Q1_0_g128. See docs/avx2-repack-design/03-design-brief.md
+  Configuration: nb=64 (n=8192 weights), iters=8, seed=0xc0ffee
+
+Build features: AVX512F AVX512BW AVX512VL AVX512VNNI AVX2 FMA F16C
+
+Parity check (4 rows, scalar baseline):
+  row 0  scalar=    -40.244610  avx2_single=    -40.244576  gemv_avx2=    -40.244576  avx512_single=    -40.244576  gemv_avx512=    -40.244576  OK
+  row 1  scalar=    -68.837616  avx2_single=    -68.837593  gemv_avx2=    -68.837593  avx512_single=    -68.837593  gemv_avx512=    -68.837593  OK
+  row 2  scalar=     64.643204  avx2_single=     64.643234  gemv_avx2=     64.643234  avx512_single=     64.643234  gemv_avx512=     64.643234  OK
+  row 3  scalar=     -0.807468  avx2_single=     -0.807454  gemv_avx2=     -0.807454  avx512_single=     -0.807454  gemv_avx512=     -0.807454  OK
+Parity: OK
+
+  Timing (64 weight blocks = 8192 weights, 8 iters, median ns):
+    scalar                      150991 ns / 4 rows  (37747.8 ns/row)
+    vec_dot_avx2                 50164 ns / 4 rows  (12541.0 ns/row)
+    gemv_4x4_avx2 (NEW)         153907 ns / 4 rows  (38476.8 ns/row)
+    vec_dot_avx512_vnni         497858 ns / 4 rows  (124464.5 ns/row)
+    gemv_4x4_avx512_vnni (NEW)      199452 ns / 4 rows  (49863.0 ns/row)
+=== SDE -mix per-function dynamic instruction counts (Ice Lake) ===
+Workload: --blocks 4096 --iters 4 (524288 weights/call, 4 timing iters).
+Each function processed bit-for-bit identical input data and produces the
+same outputs (parity established above), so dynamic instruction counts are
+directly comparable as a structural-perf proxy.
+
+Function                          Dynamic ICOUNT  Ratio vs vec_dot_avx512_vnni
+vec_dot_avx2 (single-row)                7209420  1.572x  (single-row AVX2 baseline)
+vec_dot_avx512_vnni (single-row)         4587920  1.000x  (in-tree AVX-512 floor)
+gemv_4x4_avx2 (Kernel A)                 5898600  1.286x  (in-tree 4x4, AVX2 hosts)
+gemv_4x4_avx512_vnni (Kernel C)          3768655  0.821x  (1.22x speedup vs floor)
+
+Source: SDE 9.48.0 -mix output, sde-mix-icx2.txt (regenerable with the
+instructions in 08-avx512-vnni-kernel-c.md §Reproducing the numbers).

@@ -523,6 +523,133 @@ void gemv_q1g128_4x4_avx_vnni(int n,
 #endif // __AVXVNNI__
 
 // -----------------------------------------------------------------
+// Kernel (e): existing single-row AVX-512BW+VL+VNNI path, verbatim
+// from `ggml/src/ggml-cpu/arch/x86/quants.c:861-895` with the
+// surrounding linkage stripped. This is the floor that Kernel C
+// (below) is trying to beat on AVX-512+VNNI hosts (Cascade Lake,
+// Ice Lake, Sapphire Rapids, Zen 4).
+//
+// Stays in 256-bit lanes intentionally — the upstream comment at the
+// call site argues this avoids lane-crossing overhead. We keep that
+// constraint here so Kernel C is an apples-to-apples comparison.
+// -----------------------------------------------------------------
+
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
+
+// `noinline` keeps a clean per-function dynamic instruction count under
+// SDE -mix; otherwise the compiler folds the body into the caller's
+// timing lambda and the structural-perf comparison gets muddied.
+__attribute__((noinline))
+float vec_dot_avx512_vnni(int n, const block_q1_0_g128 * x, const block_q8_0 * y) {
+    const int nb = n / QK1_0_g128;
+    __m256 acc = _mm256_setzero_ps();
+    const __m256i zero_256     = _mm256_setzero_si256();
+    const __m256i all_ones_256 = _mm256_set1_epi8(1);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = fp16_to_fp32(x[ib].d_bits);
+        for (int k = 0; k < 4; ++k) {
+            const float d1 = fp16_to_fp32(y[ib*4 + k].d_bits);
+            uint32_t qbits32;
+            std::memcpy(&qbits32, x[ib].qs + k * 4, sizeof(qbits32));
+            const __m256i qy      = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+            const __m256i neg_qy  = _mm256_sub_epi8(zero_256, qy);
+            const __m256i s_qy    = _mm256_mask_blend_epi8(
+                (__mmask32)qbits32, neg_qy, qy);
+            const __m256i int_acc = _mm256_dpbusd_epi32(zero_256, all_ones_256, s_qy);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d0 * d1),
+                                  _mm256_cvtepi32_ps(int_acc), acc);
+        }
+    }
+    return hsum_float_8(acc);
+}
+
+// -----------------------------------------------------------------
+// Kernel (f): proposed AVX-512 VNNI 4x4 GEMV (Kernel C from the design
+// brief follow-up #3).
+//
+// Same outer skeleton as Kernel B (AVX-VNNI 4x4 GEMV), but exploits
+// two AVX-512BW+VL features that AVX-VNNI alone does not have:
+//
+//   1. `_mm256_mask_blend_epi8(qbits32, neg_qy, qy)` -- the 32-bit
+//      qbits register is consumed directly as a __mmask32. This
+//      eliminates the 5-instruction shuffle/and/cmpeq sequence that
+//      Kernel B needs to expand `qbits32` to a 256-bit byte mask
+//      before blendv. Net: -4 ops per (sb, r_w) for the mask path.
+//
+//   2. `_mm256_dpbusd_epi32(...)` (EVEX-encoded) replaces the VEX
+//      `_mm256_dpbusd_avx_epi32(...)` of Kernel B. Same throughput
+//      on hosts that have both encodings, but Kernel C is also
+//      reachable on Cascade Lake / Ice Lake which have AVX-512+VNNI
+//      but NOT AVX-VNNI -- those hosts are where the existing
+//      single-row AVX-512 vec_dot would otherwise be the only path.
+//
+// Output is bit-identical to Kernel B (and therefore to the AVX2
+// path and the scalar reference) modulo FP16 roundoff -- both
+// compute sum_lane(+-qy) per (r_a, r_w) where the sign is
+// determined by the same bit-mask of `qbits`.
+//
+// Compiled in only when AVX-512BW+VL+VNNI is available. On AVX2-only
+// Zen 3 / Skylake-X / Cascade Lake-no-VNNI hosts this code is
+// omitted at compile time.
+// -----------------------------------------------------------------
+
+void gemv_q1g128_4x4_avx512_vnni(int n,
+                                 float out4[4],
+                                 const block_q1_0_g128x4 * x,
+                                 const block_q8_0 * y) {
+    const int nb = n / QK1_0_g128;
+
+    const __m256i ones_b = _mm256_set1_epi8(1);
+    const __m256i zero   = _mm256_setzero_si256();
+
+    __m256 acc[4] = {
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+    };
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m128 d_rows = _mm_cvtph_ps(
+            _mm_loadl_epi64((const __m128i *)&x[ib].d_bits[0]));
+        alignas(16) float d_rows_arr[4];
+        _mm_store_ps(d_rows_arr, d_rows);
+
+        for (int k = 0; k < 4; ++k) {
+            const __m256i qy = _mm256_loadu_si256(
+                (const __m256i *)y[ib*4 + k].qs);
+            const float d_y = fp16_to_fp32(y[ib*4 + k].d_bits);
+            const __m256i neg_qy = _mm256_sub_epi8(zero, qy);
+
+            // 4 rows worth of qbits32 in one 16-byte register.
+            const __m128i qbits_4rows = _mm_loadu_si128(
+                (const __m128i *)&x[ib].qs[k*16]);
+            alignas(16) uint32_t qbits_arr[4];
+            _mm_store_si128((__m128i *)qbits_arr, qbits_4rows);
+
+            for (int r = 0; r < 4; ++r) {
+                // No bit-expansion: __mmask32 consumes the GPR directly.
+                const __m256i signed_qy = _mm256_mask_blend_epi8(
+                    (__mmask32)qbits_arr[r], neg_qy, qy);
+
+                const __m256i int_acc = _mm256_dpbusd_epi32(
+                    zero, ones_b, signed_qy);
+
+                acc[r] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(d_rows_arr[r] * d_y),
+                    _mm256_cvtepi32_ps(int_acc),
+                    acc[r]);
+            }
+        }
+    }
+
+    for (int r = 0; r < 4; ++r) {
+        out4[r] = hsum_float_8(acc[r]);
+    }
+}
+
+#endif // __AVX512BW__ && __AVX512VL__ && __AVX512VNNI__
+
+// -----------------------------------------------------------------
 // Parity test. All four kernels must agree within FP32 tolerance on
 // a synthetic 4-row workload. Tolerance is generous (1e-3 relative)
 // because FP16 deltas accumulate roundoff differently in scalar vs
@@ -558,6 +685,13 @@ bool run_parity(int nb, uint64_t seed) {
 #endif
     }
 
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
+    float avx512_single[4];
+    for (int r = 0; r < 4; ++r) {
+        avx512_single[r] = vec_dot_avx512_vnni(n, rows[r].data(), y.data());
+    }
+#endif
+
     // Build the repacked weight stream.
     std::vector<block_q1_0_g128x4> packed(nb);
     for (int ib = 0; ib < nb; ++ib) {
@@ -579,6 +713,11 @@ bool run_parity(int nb, uint64_t seed) {
     gemv_q1g128_4x4_avx_vnni(n, gemv_vnni, packed.data(), y.data());
 #endif
 
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
+    float gemv_avx512[4];
+    gemv_q1g128_4x4_avx512_vnni(n, gemv_avx512, packed.data(), y.data());
+#endif
+
     bool ok = true;
     for (int r = 0; r < 4; ++r) {
         const bool a = approx_equal(scalar[r], avx2_single[r]);
@@ -591,6 +730,13 @@ bool run_parity(int nb, uint64_t seed) {
         const bool c = approx_equal(scalar[r], gemv_vnni[r]);
         row_ok = row_ok && c;
         std::printf("  gemv_vnni=%14.6f", gemv_vnni[r]);
+#endif
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
+        const bool d = approx_equal(scalar[r], avx512_single[r]);
+        const bool e = approx_equal(scalar[r], gemv_avx512[r]);
+        row_ok = row_ok && d && e;
+        std::printf("  avx512_single=%14.6f  gemv_avx512=%14.6f",
+                    avx512_single[r], gemv_avx512[r]);
 #endif
         ok = ok && row_ok;
         std::printf("  %s\n", row_ok ? "OK" : "MISMATCH");
@@ -719,6 +865,36 @@ void run_timing(int nb, int iters, uint64_t seed) {
         (void)sink;
     }
 #endif
+
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
+    {
+        volatile float sink = 0.0f;
+        const double t = median_ns(
+            [&]{
+                for (int r = 0; r < 4; ++r) {
+                    sink += vec_dot_avx512_vnni(n, rows[r].data(), y.data());
+                }
+            },
+            iters);
+        std::printf("    %-22s  %10.0f ns / 4 rows  (%.1f ns/row)\n",
+                    "vec_dot_avx512_vnni", t, t / (4.0 * rows_per_call_single));
+        (void)sink;
+    }
+
+    {
+        volatile float sink = 0.0f;
+        const double t = median_ns(
+            [&]{
+                float out4[4];
+                gemv_q1g128_4x4_avx512_vnni(n, out4, packed.data(), y.data());
+                sink += out4[0] + out4[1] + out4[2] + out4[3];
+            },
+            iters);
+        std::printf("    %-22s  %10.0f ns / 4 rows  (%.1f ns/row)\n",
+                    "gemv_4x4_avx512_vnni (NEW)", t, t / rows_per_call_gemv);
+        (void)sink;
+    }
+#endif
 }
 
 } // namespace
@@ -770,6 +946,12 @@ int main(int argc, char ** argv) {
     std::printf("Build features:");
 #if defined(__AVX512F__)
     std::printf(" AVX512F");
+#endif
+#if defined(__AVX512BW__)
+    std::printf(" AVX512BW");
+#endif
+#if defined(__AVX512VL__)
+    std::printf(" AVX512VL");
 #endif
 #if defined(__AVX512VNNI__)
     std::printf(" AVX512VNNI");
