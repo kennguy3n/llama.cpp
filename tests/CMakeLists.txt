@@ -250,6 +250,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-q1-g128-repack-parity.cpp)
+    llama_build_and_test(test-q2-0-repack-parity.cpp)
     llama_build_and_test(test-rope.cpp)
 endif()
 

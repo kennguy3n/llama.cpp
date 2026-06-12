@@ -2108,6 +2108,113 @@ void ggml_gemm_q1_0_g128_4x4_q8_0_generic(int                        n,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Q2_0 4-row interleaved GEMV / GEMM. The packed layout matches
+// `block_q2_0x4` in `repack.h`: 4 ggml_half deltas followed by 4 sub-blocks
+// of 32 bytes each, with 8-byte interleave granularity per row inside each
+// sub-block. Each `block_q2_0x4` covers 128 weights per row across 4 rows;
+// each activation column has 4 `block_q8_0` (32 weights each) per Q2_0 block.
+//
+// Q2_0 packs a ternary code {0,1,2} per weight in 2 bits (4 codes/byte) with a
+// single FP16 delta per 128-weight block; the dequantised value is
+// `(code - 1) * d` (code 0 -> -1, 1 -> 0, 2 -> +1). See `quantize_row_q2_0_ref`
+// in `ggml-quants.c` for the canonical bit packing this decoder mirrors.
+// ---------------------------------------------------------------------------
+
+void ggml_gemv_q2_0_4x4_q8_0_generic(int                        n,
+                                     float * GGML_RESTRICT      s,
+                                     size_t                     bs,
+                                     const void * GGML_RESTRICT vx,
+                                     const void * GGML_RESTRICT vy,
+                                     int                        nr,
+                                     int                        nc) {
+    const int qk                = QK8_0;
+    const int nb_q8             = n / qk;            // number of Q8_0 blocks per src1 column
+    const int nb                = nb_q8 / 4;         // number of Q2_0x4 blocks per row group
+    const int ncols_interleaved = 4;
+
+    assert(nr == 1);
+    assert(n % QK2_0 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx + (x * nb);
+
+        float sumf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int ib = 0; ib < nb; ib++) {
+            float drow[4];
+            for (int r = 0; r < 4; r++) {
+                drow[r] = GGML_CPU_FP16_TO_FP32(b_ptr[ib].d[r]);
+            }
+            for (int k = 0; k < 4; k++) {
+                const float dy = GGML_CPU_FP16_TO_FP32(a_ptr[ib*4 + k].d);
+                for (int r = 0; r < 4; r++) {
+                    int sumi = 0;
+                    // per-row, per-sub-block 8 packed bytes -> 32 ternary weights
+                    const int qs_off = k * 32 + r * 8;
+                    for (int j = 0; j < QK8_0; j++) {
+                        const uint8_t byte = b_ptr[ib].qs[qs_off + (j >> 2)];
+                        const int     code = (byte >> ((j & 3) * 2)) & 3;
+                        const int     xi   = code - 1; // {0,1,2} -> {-1,0,+1}
+                        sumi += xi * (int) a_ptr[ib*4 + k].qs[j];
+                    }
+                    sumf[r] += drow[r] * dy * (float) sumi;
+                }
+            }
+        }
+        for (int r = 0; r < 4; r++) {
+            s[x * ncols_interleaved + r] = sumf[r];
+        }
+    }
+}
+
+void ggml_gemm_q2_0_4x4_q8_0_generic(int                        n,
+                                     float * GGML_RESTRICT      s,
+                                     size_t                     bs,
+                                     const void * GGML_RESTRICT vx,
+                                     const void * GGML_RESTRICT vy,
+                                     int                        nr,
+                                     int                        nc) {
+    // Generic-fallback GEMM: unpack the 4-row-interleaved `block_q8_0x4`
+    // activations (produced by `ggml_quantize_mat_q8_0_4x4`) into plain
+    // `block_q8_0` rows, then delegate to the 4-row GEMV per activation row.
+    // `bs` is the FP32 output row stride in float elements, matching every
+    // other GEMM in this file.
+    const int qk    = QK8_0;
+    const int nb_q8 = n / qk;
+
+    assert(nr % 4 == 0);
+    assert(nc % 4 == 0);
+    assert(n % QK2_0 == 0);
+
+    std::vector<block_q8_0> unpacked((size_t) nb_q8);
+    const block_q8_0x4 * a_pack_base = (const block_q8_0x4 *) vy;
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_pack = a_pack_base + (size_t) y * nb_q8;
+        for (int r = 0; r < 4; r++) {
+            // mirror of `ggml_quantize_mat_q8_0_4x4_generic` encoder:
+            // blck_size_interleave = 4.
+            for (int ib = 0; ib < nb_q8; ib++) {
+                unpacked[ib].d = a_pack[ib].d[r];
+                for (int j = 0; j < QK8_0; j++) {
+                    const int encoded_idx = (j / 4) * 16 + r * 4 + (j % 4);
+                    unpacked[ib].qs[j] = a_pack[ib].qs[encoded_idx];
+                }
+            }
+            ggml_gemv_q2_0_4x4_q8_0(n,
+                                    s + (size_t)(y * 4 + r) * bs, bs,
+                                    vx, unpacked.data(),
+                                    /* nr = */ 1, nc);
+        }
+    }
+}
+
 } // extern "C"
 
 static block_q8_0x4 make_block_q8_0x4(block_q8_0 * in, unsigned int blck_size_interleave) {
@@ -2843,6 +2950,60 @@ static int repack_q1_0_g128_to_q1_0_g128_4_bl(struct ggml_tensor * t, int interl
     return 0;
 }
 
+// 4-row interleave of `block_q2_0`. On-disk byte layout per 128-weight × 4-row
+// block (136 B), described in `repack.h:block_q2_0x4`:
+//
+//   [d0 d1 d2 d3]                  // 8 B: 4 ggml_half deltas
+//   [r0_sb_k r1_sb_k r2_sb_k r3_sb_k] (k = 0..3)  // 4 sub-blocks × 32 B
+//
+// Sub-block k holds 32 ternary codes per row (8 packed bytes per row).
+static block_q2_0x4 make_block_q2_0x4(block_q2_0 * in) {
+    block_q2_0x4 out;
+    for (int r = 0; r < 4; r++) {
+        out.d[r] = in[r].d;
+    }
+    for (int k = 0; k < 4; k++) {
+        for (int r = 0; r < 4; r++) {
+            memcpy(&out.qs[k * 32 + r * 8], &in[r].qs[k * 8], 8);
+        }
+    }
+    return out;
+}
+
+static int repack_q2_0_to_q2_0_4_bl(struct ggml_tensor * t, int interleave_block,
+                                    const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q2_0);
+    GGML_ASSERT(interleave_block == 4);
+
+    constexpr int  nrows_interleaved = 4;
+    constexpr int  bytes_per_block   = (int) sizeof(block_q2_0);
+
+    const block_q2_0   * src = (const block_q2_0 *) data;
+          block_q2_0x4 * dst = (block_q2_0x4    *) t->data;
+
+    block_q2_0 dst_tmp[nrows_interleaved];
+
+    const int     nrow    = ggml_nrows(t);
+    const int64_t nblocks = t->ne[0] / QK2_0;
+
+    GGML_ASSERT(data_size == (size_t) nrow * (size_t) nblocks * (size_t) bytes_per_block);
+
+    if (t->ne[1] % nrows_interleaved != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                dst_tmp[i] = src[x + i * nblocks];
+            }
+            *dst++ = make_block_q2_0x4(dst_tmp);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+}
+
 static block_mxfp4x4 make_block_mxfp4x4(block_mxfp4 * in, unsigned int blck_size_interleave) {
     block_mxfp4x4 out;
 
@@ -3036,6 +3197,10 @@ template <> int repack<block_q1_0_g128, 4, 4>(struct ggml_tensor * t, const void
     return repack_q1_0_g128_to_q1_0_g128_4_bl(t, 4, data, data_size);
 }
 
+template <> int repack<block_q2_0, 4, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_q2_0_to_q2_0_4_bl(t, 4, data, data_size);
+}
+
 // gemv
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
 void gemv(int, float *, size_t, const void *, const void *, int, int);
@@ -3115,6 +3280,10 @@ template <> void gemv<block_q1_0_g128, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, s
     ggml_gemv_q1_0_g128_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+template <> void gemv<block_q2_0, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q2_0_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
 // gemm
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
 void gemm(int, float *, size_t, const void *, const void *, int, int);
@@ -3192,6 +3361,10 @@ template <> void gemm<block_q8_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
 
 template <> void gemm<block_q1_0_g128, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_q1_0_g128_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_q2_0, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q2_0_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
 class tensor_traits_base : public ggml::cpu::tensor_traits {
@@ -3605,6 +3778,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     // instance for Q1_0_g128 (Phase 3 AVX2 repack, see docs/avx2-repack-design/)
     static const ggml::cpu::repack::tensor_traits<block_q1_0_g128, 4, 4, GGML_TYPE_Q8_0> q1_0_g128_4x4_q8_0;
 
+    // instance for Q2_0 (AVX2 repack, see docs/avx2-repack-design/09-q2-0-phase.md)
+    static const ggml::cpu::repack::tensor_traits<block_q2_0, 4, 4, GGML_TYPE_Q8_0> q2_0_4x4_q8_0;
+
     if (cur->type == GGML_TYPE_Q4_0) {
         if (ggml_cpu_has_avx2() || (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)
             || (ggml_cpu_has_riscv_v() && (ggml_cpu_get_rvv_vlen() >= QK4_0))) {
@@ -3708,6 +3884,16 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         if (ggml_cpu_has_avx2() && !ggml_cpu_has_avx512()) {
             if (cur->ne[1] % 4 == 0) {
                 return &q1_0_g128_4x4_q8_0;
+            }
+        }
+    } else if (cur->type == GGML_TYPE_Q2_0) {
+        // Q2_0 has a hand-tuned single-row AVX-512 path in
+        // ggml/src/ggml-cpu/arch/x86/quants.c. As with Q1_0_g128, only opt
+        // into the 4-row runtime repack where that fast path is unavailable,
+        // i.e. AVX2 (with or without AVX-VNNI) but no AVX-512.
+        if (ggml_cpu_has_avx2() && !ggml_cpu_has_avx512()) {
+            if (cur->ne[1] % 4 == 0) {
+                return &q2_0_4x4_q8_0;
             }
         }
     }
