@@ -131,6 +131,31 @@ static_assert(sizeof(block_q1_0_g128x4) == 4 * sizeof(ggml_half) + QK1_0_g128 * 
 static_assert(sizeof(block_q1_0_g128x4) == 4 * sizeof(block_q1_0_g128),
               "block_q1_0_g128x4 must be size-equivalent to 4 rows of block_q1_0_g128");
 
+// 4-row-interleaved repack of `Q2_0` (2-bit ternary, 128-weight blocks) for
+// the AVX2 runtime-repack path. Mirrors the `block_q1_0_g128x4` design above;
+// see `docs/avx2-repack-design/09-q2-0-phase.md` for the layout rationale.
+//
+// On-disk GGUF is unchanged: this layout is produced in-memory at tensor-init
+// time. Each block packs 128 weights × 4 rows (136 B total):
+//
+//   [d0 d1 d2 d3]                  // 8 B: 4 ggml_half deltas
+//   [r0_sb0 r1_sb0 r2_sb0 r3_sb0]  // 32 B: 8-byte interleave per row, sub-block 0
+//   [r0_sb1 r1_sb1 r2_sb1 r3_sb1]  // 32 B: sub-block 1
+//   [r0_sb2 r1_sb2 r2_sb2 r3_sb2]  // 32 B: sub-block 2
+//   [r0_sb3 r1_sb3 r2_sb3 r3_sb3]  // 32 B: sub-block 3
+//
+// Sub-block k holds 32 ternary codes per row (8 packed bytes per row, 2 bits
+// per code, 4 codes per byte), aligned to the 4-row q8_0 sub-blocks consumed
+// by the GEMV/GEMM kernels.
+struct block_q2_0x4 {
+    ggml_half d[4];    // deltas for 4 rows
+    uint8_t   qs[128]; // 4 sub-blocks × 4 rows × 8 bytes = 128 bytes
+};
+static_assert(sizeof(block_q2_0x4) == 4 * sizeof(ggml_half) + QK2_0 * 4 / 4,
+              "wrong q2_0x4 block size/padding");
+static_assert(sizeof(block_q2_0x4) == 4 * sizeof(block_q2_0),
+              "block_q2_0x4 must be size-equivalent to 4 rows of block_q2_0");
+
 
 #if defined(__cplusplus)
 extern "C" {
@@ -174,6 +199,8 @@ void ggml_gemm_q8_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 void ggml_gemm_q8_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q1_0_g128_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_q2_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_q2_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 
 // Native implementations
 void ggml_quantize_mat_q8_0_4x4_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -213,6 +240,8 @@ void ggml_gemv_q8_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 void ggml_gemm_q8_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_q1_0_g128_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_q2_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_q2_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q1_0_g128_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 
 #if defined(__cplusplus)
